@@ -186,6 +186,16 @@ namespace Opm {
             return simulator_->runStep(*simtimer_);
         }
 
+        bool executeReportTimestep()
+        {
+            return simulator_->runStep(*simtimer_);
+        }
+
+        bool executeConvergedTimestep()
+        {
+            return simulator_->runConvergedTimestep(*simtimer_);
+        }
+
         // Called from Python to cleanup after having executed the last
         // executeStep()
         int executeStepsCleanup()
@@ -209,6 +219,21 @@ namespace Opm {
         double getPreviousReportStepSize()
         {
             return simtimer_->stepLengthTaken();
+        }
+
+        double getLastReportTimestepSize() const
+        {
+            return simtimer_->stepLengthTaken();
+        }
+
+        double getLastConvergedTimestepSize() const
+        {
+            return simulator_->lastConvergedTimestepSize();
+        }
+
+        std::size_t getConvergedTimestepCount() const
+        {
+            return simulator_->convergedTimestepCount();
         }
 
     private:

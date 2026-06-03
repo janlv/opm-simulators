@@ -21,6 +21,7 @@
 
 #include <dune/grid/common/rangegenerators.hh>
 
+#include <opm/input/eclipse/EclipseState/Grid/FaceDir.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/NNC.hpp>
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/material/common/MathToolbox.hpp>
@@ -187,6 +188,18 @@ struct PyLiveReservoirData
     using Base = PyBaseSimulator<TypeTag>;
     using FluidSystem = GetPropType<TypeTag, Properties::FluidSystem>;
 
+    static bool hasCompletedConvergedTimestep(const Base& self)
+    {
+        return self.getFlowMain().getConvergedTimestepCount() > 0;
+    }
+
+    static bool isWaterReservoirFaceRateName(const std::string& name)
+    {
+        return name == "WATER_RESERVOIR_FACE_RATE_I+" ||
+               name == "WATER_RESERVOIR_FACE_RATE_J+" ||
+               name == "WATER_RESERVOIR_FACE_RATE_K+";
+    }
+
     static void requireInitialized(const Base& self, const std::string& method)
     {
         if (!self.has_run_init_ || self.simulator_ == nullptr) {
@@ -201,6 +214,84 @@ struct PyLiveReservoirData
                 PyExc_NotImplementedError,
                 method + "() is only available for serial local OPM runs.");
         }
+    }
+
+    static void requireCompletedConvergedTimestep(const Base& self, const std::string& name)
+    {
+        if (!hasCompletedConvergedTimestep(self)) {
+            LiveReservoirDataDetail::raisePythonError(
+                PyExc_KeyError,
+                name + " is only available after a completed converged timestep.");
+        }
+    }
+
+    static py::dict getWaterReservoirFaceRateArrays(Base& self,
+                                                    const bool want_i,
+                                                    const bool want_j,
+                                                    const bool want_k)
+    {
+        requireCompletedConvergedTimestep(self, "WATER_RESERVOIR_FACE_RATE_*");
+        if (!FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
+            LiveReservoirDataDetail::raisePythonError(
+                PyExc_KeyError, "Water phase is inactive for reservoir face-rate export.");
+        }
+
+        const int x_face_id = FaceDir::ToIntersectionIndex(FaceDir::DirEnum::XPlus);
+        const int y_face_id = FaceDir::ToIntersectionIndex(FaceDir::DirEnum::YPlus);
+        const int z_face_id = FaceDir::ToIntersectionIndex(FaceDir::DirEnum::ZPlus);
+
+        using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
+        const auto& simulator = *self.simulator_;
+        const auto num_dof = simulator.model().numGridDof();
+        std::vector<double> flow_i(want_i ? num_dof : 0, 0.0);
+        std::vector<double> flow_j(want_j ? num_dof : 0, 0.0);
+        std::vector<double> flow_k(want_k ? num_dof : 0, 0.0);
+        ElementContext elem_ctx(simulator);
+        constexpr auto time_idx = 0u;
+
+        for (const auto& elem : elements(simulator.gridView())) {
+            elem_ctx.updateStencil(elem);
+            elem_ctx.updateAllIntensiveQuantities();
+            elem_ctx.updateExtensiveQuantities(time_idx);
+
+            const auto& stencil = elem_ctx.stencil(time_idx);
+            for (unsigned scvf_idx = 0; scvf_idx < elem_ctx.numInteriorFaces(time_idx); ++scvf_idx) {
+                const auto& face = stencil.interiorFace(scvf_idx);
+                const auto dir_id = face.dirId();
+                if (!((want_i && dir_id == x_face_id) ||
+                      (want_j && dir_id == y_face_id) ||
+                      (want_k && dir_id == z_face_id))) {
+                    continue;
+                }
+
+                const auto global_dof_idx = elem_ctx.globalSpaceIndex(face.interiorIndex(), time_idx);
+                const auto& ext_quants = elem_ctx.extensiveQuantities(scvf_idx, time_idx);
+                const auto alpha = getValue(ext_quants.extrusionFactor()) * face.area();
+                const auto value = alpha * getValue(ext_quants.volumeFlux(FluidSystem::waterPhaseIdx));
+
+                if (want_i && dir_id == x_face_id) {
+                    flow_i[global_dof_idx] = value;
+                }
+                else if (want_j && dir_id == y_face_id) {
+                    flow_j[global_dof_idx] = value;
+                }
+                else if (want_k && dir_id == z_face_id) {
+                    flow_k[global_dof_idx] = value;
+                }
+            }
+        }
+
+        py::dict result;
+        if (want_i) {
+            result["WATER_RESERVOIR_FACE_RATE_I+"] = LiveReservoirDataDetail::copyToArray(flow_i);
+        }
+        if (want_j) {
+            result["WATER_RESERVOIR_FACE_RATE_J+"] = LiveReservoirDataDetail::copyToArray(flow_j);
+        }
+        if (want_k) {
+            result["WATER_RESERVOIR_FACE_RATE_K+"] = LiveReservoirDataDetail::copyToArray(flow_k);
+        }
+        return result;
     }
 
     static py::array_t<long long> getActiveToGlobalCells(Base& self)
@@ -252,6 +343,11 @@ struct PyLiveReservoirData
         std::vector<std::string> names{"RPORV", "PRESSURE"};
         if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
             names.push_back("SWAT");
+            if (hasCompletedConvergedTimestep(self)) {
+                names.push_back("WATER_RESERVOIR_FACE_RATE_I+");
+                names.push_back("WATER_RESERVOIR_FACE_RATE_J+");
+                names.push_back("WATER_RESERVOIR_FACE_RATE_K+");
+            }
         }
         if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
             names.push_back("SGAS");
@@ -317,6 +413,14 @@ struct PyLiveReservoirData
                     self.getFluidState().getFluidStateVariable("pg"));
             }
         }
+        if (isWaterReservoirFaceRateName(name)) {
+            const auto arrays = getWaterReservoirFaceRateArrays(
+                self,
+                name == "WATER_RESERVOIR_FACE_RATE_I+",
+                name == "WATER_RESERVOIR_FACE_RATE_J+",
+                name == "WATER_RESERVOIR_FACE_RATE_K+");
+            return arrays[py::str(name)].template cast<py::array_t<double>>();
+        }
         LiveReservoirDataDetail::raisePythonError(
             PyExc_KeyError,
             "Unknown live cell array: " + name);
@@ -326,8 +430,34 @@ struct PyLiveReservoirData
     static py::dict getLiveCellArrays(Base& self, const std::vector<std::string>& names)
     {
         py::dict result;
+        bool want_i = false;
+        bool want_j = false;
+        bool want_k = false;
         for (const auto& name : names) {
-            result[py::str(name)] = getLiveCellArray(self, name);
+            if (name == "WATER_RESERVOIR_FACE_RATE_I+") {
+                want_i = true;
+            }
+            else if (name == "WATER_RESERVOIR_FACE_RATE_J+") {
+                want_j = true;
+            }
+            else if (name == "WATER_RESERVOIR_FACE_RATE_K+") {
+                want_k = true;
+            }
+            else {
+                result[py::str(name)] = getLiveCellArray(self, name);
+            }
+        }
+        if (want_i || want_j || want_k) {
+            const auto arrays = getWaterReservoirFaceRateArrays(self, want_i, want_j, want_k);
+            if (want_i) {
+                result["WATER_RESERVOIR_FACE_RATE_I+"] = arrays["WATER_RESERVOIR_FACE_RATE_I+"];
+            }
+            if (want_j) {
+                result["WATER_RESERVOIR_FACE_RATE_J+"] = arrays["WATER_RESERVOIR_FACE_RATE_J+"];
+            }
+            if (want_k) {
+                result["WATER_RESERVOIR_FACE_RATE_K+"] = arrays["WATER_RESERVOIR_FACE_RATE_K+"];
+            }
         }
         return result;
     }

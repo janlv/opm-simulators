@@ -124,6 +124,12 @@ namespace Opm
         dt_ = dt;
     }
 
+    void AdaptiveSimulatorTimer::setCurrentStepNum(int step)
+    {
+        assert(step >= 0);
+        current_step_ = step;
+    }
+
     double AdaptiveSimulatorTimer::stepLengthTaken() const
     {
         assert( ! steps_.empty() );

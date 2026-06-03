@@ -78,6 +78,9 @@ namespace Opm
         // \brief Set next step length
         void setCurrentStepLength(double dt);
 
+        /// \brief Set the current converged-substep index.
+        void setCurrentStepNum(int step);
+
         /// \brief \copydoc SimulationTimer::totalTime
         double totalTime() const;
 

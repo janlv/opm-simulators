@@ -205,6 +205,61 @@ step(const SimulatorTimer& simulator_timer,
 }
 
 template<class TypeTag>
+template <class Solver>
+SimulatorReport
+AdaptiveTimeStepping<TypeTag>::
+stepConvergedTimestep(const SimulatorTimer& simulator_timer,
+                      Solver& solver,
+                      const bool is_event,
+                      const TuningUpdateCallback& tuning_updater,
+                      const double elapsed_time,
+                      const double remaining_time,
+                      const int converged_step_index,
+                      const bool first_substep,
+                      double* converged_step_length)
+{
+    if (remaining_time <= 0.0) {
+        OPM_THROW(std::invalid_argument, "remaining_time must be positive for stepConvergedTimestep()");
+    }
+    if (converged_step_index < 0) {
+        OPM_THROW(std::invalid_argument, "converged_step_index must be non-negative.");
+    }
+
+    SubStepper<Solver> sub_stepper{
+        *this, simulator_timer, solver, is_event, tuning_updater,
+    };
+
+    if (first_substep) {
+        tuning_updater(elapsed_time, this->suggestedNextStep(), converged_step_index);
+        this->maybeModifySuggestedTimeStepAtBeginningOfReportStep_(remaining_time, is_event);
+    }
+
+    AdaptiveSimulatorTimer substep_timer{
+        simulator_timer.startDateTime(),
+        remaining_time,
+        elapsed_time,
+        this->suggestedNextStep(),
+        simulator_timer.reportStepNum(),
+        this->max_time_step_
+    };
+    substep_timer.setCurrentStepNum(converged_step_index);
+
+    const bool final_step = substep_timer.currentStepLength() >= remaining_time;
+    SubStepIteration<Solver> substep_iteration{
+        sub_stepper,
+        substep_timer,
+        remaining_time,
+        final_step,
+        /*stop_after_first_converged_substep=*/true,
+    };
+    auto report = substep_iteration.run();
+    if (converged_step_length != nullptr) {
+        *converged_step_length = substep_timer.stepLengthTaken();
+    }
+    return report;
+}
+
+template<class TypeTag>
 template<class Serializer>
 void
 AdaptiveTimeStepping<TypeTag>::
@@ -779,6 +834,23 @@ SubStepIteration(SubStepper<Solver>& substepper,
 {
 }
 
+template<class TypeTag>
+template<class Solver>
+AdaptiveTimeStepping<TypeTag>::SubStepIteration<Solver>::
+SubStepIteration(SubStepper<Solver>& substepper,
+                 AdaptiveSimulatorTimer& substep_timer,
+                 const double original_time_step,
+                 bool final_step,
+                 bool stop_after_first_converged_substep)
+    : substepper_{substepper}
+    , substep_timer_{substep_timer}
+    , original_time_step_{original_time_step}
+    , final_step_{final_step}
+    , stop_after_first_converged_substep_{stop_after_first_converged_substep}
+    , adaptive_time_stepping_{substepper.getAdaptiveTimerStepper()}
+{
+}
+
 template <class TypeTag>
 template <class Solver>
 SimulatorReport
@@ -793,6 +865,7 @@ run()
 
     // sub step time loop
     while (!this->substep_timer_.done()) {
+        bool stop_after_iteration = false;
         // if we just chopped the timestep due to convergence i.e. restarts>0
         // we dont want to update the next timestep based on Tuning
         if (restarts == 0) {
@@ -844,6 +917,10 @@ run()
 
             report.success.converged = this->substep_timer_.done();
             this->substep_timer_.setLastStepFailed(false);
+            if (this->stop_after_first_converged_substep_) {
+                report.success.converged = true;
+                stop_after_iteration = true;
+            }
         }
         else { // in case of no convergence or time step tolerance test failure
             report += substep_report;
@@ -874,6 +951,9 @@ run()
             }
         }
         problem.setNextTimeStepSize(this->substep_timer_.currentStepLength());
+        if (stop_after_iteration) {
+            break;
+        }
     }
     updateSuggestedNextStep_();
     return report;

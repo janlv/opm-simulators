@@ -20,6 +20,7 @@
 #include "config.h"
 #include <opm/simulators/flow/python/PyBlackOilSimulator.hpp>
 #include <opm/simulators/flow/python/PyLiveReservoirData.hpp>
+#include <opm/simulators/flow/python/PyTimeStepping.hpp>
 // NOTE: This file will be generated at compile time and placed in the build directory
 // See python/generate_docstring_hpp.py, and python/simulators/CMakeLists.txt for details
 #include <PyBlackOilSimulatorDoc.hpp>
@@ -99,6 +100,7 @@ void export_PyBlackOilSimulator(py::module& m)
         .def("step", &PyBaseSimulator<TypeTag>::step, step_docstring)
         .def("step_cleanup", &PyBaseSimulator<TypeTag>::stepCleanup, stepCleanup_docstring)
         .def("step_init", &PyBaseSimulator<TypeTag>::stepInit, stepInit_docstring);
+    bindTimeStepping<TypeTag>(cls);
     bindLiveReservoirData<TypeTag>(cls);
 }
 

@@ -44,11 +44,15 @@ template<class TypeTag>
 struct PyLiveReservoirData;
 
 template<class TypeTag>
+struct PyTimeStepping;
+
+template<class TypeTag>
 class PyBaseSimulator
 {
 private:
     using Simulator = GetPropType<TypeTag, Properties::Simulator>;
     friend struct PyLiveReservoirData<TypeTag>;
+    friend struct PyTimeStepping<TypeTag>;
 
 public:
     PyBaseSimulator(const std::string& deckFilename,

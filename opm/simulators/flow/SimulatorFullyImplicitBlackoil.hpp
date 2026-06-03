@@ -59,6 +59,9 @@
 #include <opm/simulators/utils/HDF5Serializer.hpp>
 #endif
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -605,6 +608,243 @@ public:
         return true;
     }
 
+    bool runConvergedTimestep(SimulatorTimer& timer)
+    {
+        if (timer.done()) {
+            return false;
+        }
+
+        if (!adaptiveTimeStepping_) {
+            const double report_step_length = timer.currentStepLength();
+            const bool continue_looping = runStep(timer);
+            if (continue_looping) {
+                lastConvergedTimestepSize_ = report_step_length;
+                ++convergedTimestepCount_;
+            }
+            return continue_looping;
+        }
+
+#ifdef RESERVOIR_COUPLING_ENABLED
+        if (this->reservoirCouplingMaster_ || this->reservoirCouplingSlave_) {
+            OPM_THROW(std::logic_error,
+                      "Converged internal timestep stepping is not supported for reservoir coupling mode.");
+        }
+#endif
+
+        if (!convergedTimestepState_.active) {
+            if (schedule().exitStatus().has_value()) {
+                if (terminalOutput_) {
+                    OpmLog::info("Stopping simulation since EXIT was triggered by an action keyword.");
+                }
+                report_.success.exit_status = schedule().exitStatus().value();
+                return false;
+            }
+
+            if (serializer_.shouldLoad()) {
+                serializer_.loadTimerInfo(timer);
+            }
+
+            // Report timestep. This mirrors runStep() so Python live stepping enters
+            // the same report-step state without changing the existing report-step API.
+            if (terminalOutput_) {
+                std::ostringstream ss;
+                timer.report(ss);
+                OpmLog::debug(ss.str());
+                details::outputReportStep(timer);
+            }
+
+            // write the inital state at the report stage
+            if (timer.initialStep()) {
+                Dune::Timer perfTimer;
+                perfTimer.start();
+
+                simulator_.setEpisodeIndex(-1);
+                simulator_.setEpisodeLength(0.0);
+                simulator_.setTimeStepSize(0.0);
+                wellModel_().beginReportStep(timer.currentStepNum());
+                simulator_.problem().writeOutput(true);
+
+                report_.success.output_write_time += perfTimer.stop();
+            }
+
+            solverTimer_->start();
+
+            if (!solver_) {
+                solver_ = createSolver(wellModel_());
+            }
+
+            simulator_.startNextEpisode(
+                simulator_.startTime()
+                   + schedule().seconds(timer.currentStepNum()),
+                timer.currentStepLength());
+            simulator_.setEpisodeIndex(timer.currentStepNum());
+
+            if (serializer_.shouldLoad()) {
+                wellModel_().prepareDeserialize(serializer_.loadStep() - 1);
+                serializer_.loadState();
+                simulator_.model().invalidateAndUpdateIntensiveQuantities(/*timeIdx=*/0);
+            }
+
+            this->solver_->model().beginReportStep();
+
+            const auto& events = schedule()[timer.currentStepNum()].events();
+            const bool event = events.hasEvent(ScheduleEvents::NEW_WELL) ||
+                events.hasEvent(ScheduleEvents::INJECTION_TYPE_CHANGED) ||
+                events.hasEvent(ScheduleEvents::WELL_SWITCHED_INJECTOR_PRODUCER) ||
+                events.hasEvent(ScheduleEvents::PRODUCTION_UPDATE) ||
+                events.hasEvent(ScheduleEvents::INJECTION_UPDATE) ||
+                events.hasEvent(ScheduleEvents::WELL_STATUS_CHANGE);
+
+            convergedTimestepState_ = ConvergedTimestepState{
+                true,
+                event,
+                timer.simulationTimeElapsed(),
+                timer.simulationTimeElapsed() + timer.currentStepLength(),
+                0,
+            };
+        }
+
+        const bool enableTUNING = Parameters::Get<Parameters::EnableTuning>();
+        auto tuningUpdater = [enableTUNING, this,
+                              reportStep = timer.currentStepNum()](const double curr_time,
+                                                                   double substep_length,
+                                                                   const int sub_step_number)
+        {
+            auto& schedule = this->simulator_.vanguard().schedule();
+            auto& events = this->schedule()[reportStep].events();
+
+            bool result = false;
+            if (events.hasEvent(ScheduleEvents::TUNING_CHANGE)) {
+                schedule.clear_event(ScheduleEvents::TUNING_CHANGE, reportStep);
+                const auto& sched_state = schedule[reportStep];
+                const auto& max_next_tstep = sched_state.max_next_tstep(enableTUNING);
+                const auto& tuning = sched_state.tuning();
+
+                if (enableTUNING) {
+                    adaptiveTimeStepping_->updateTUNING(max_next_tstep, tuning);
+                    solver_->model().updateTUNING(tuning);
+                    this->updateTUNING(tuning);
+                    substep_length = this->adaptiveTimeStepping_->suggestedNextStep();
+                } else {
+                    substep_length = max_next_tstep;
+                    this->adaptiveTimeStepping_->updateNEXTSTEP(max_next_tstep);
+                }
+                result = max_next_tstep > 0;
+            }
+
+            if (events.hasEvent(ScheduleEvents::TUNINGDP_CHANGE)) {
+                schedule.clear_event(ScheduleEvents::TUNINGDP_CHANGE, reportStep);
+                const auto& sched_state = schedule[reportStep];
+                const auto& tuning_dp = sched_state.tuning_dp();
+                solver_->model().updateTUNINGDP(tuning_dp);
+                this->updateTUNINGDP(tuning_dp);
+            }
+
+            const auto& wcycle = schedule[reportStep].wcycle.get();
+            if (wcycle.empty()) {
+                return result;
+            }
+
+            const auto& wmatcher = schedule.wellMatcher(reportStep);
+            double wcycle_time_step =
+                wcycle.nextTimeStep(curr_time,
+                                    substep_length,
+                                    wmatcher,
+                                    this->wellModel_().wellOpenTimes(),
+                                    this->wellModel_().wellCloseTimes(),
+                                    [sub_step_number,
+                                     &wg_events = this->wellModel_().reportStepStartEvents()]
+                                    (const std::string& name)
+                                    {
+                                        if (sub_step_number != 0) {
+                                            return false;
+                                        }
+                                        return wg_events.hasEvent(name, ScheduleEvents::REQUEST_OPEN_WELL);
+                                    });
+
+            wcycle_time_step = this->grid().comm().min(wcycle_time_step);
+            if (substep_length != wcycle_time_step) {
+                this->adaptiveTimeStepping_->updateNEXTSTEP(wcycle_time_step);
+                return true;
+            }
+
+            return result;
+        };
+
+        const double remaining_time =
+            convergedTimestepState_.end_time - convergedTimestepState_.current_time;
+        double converged_step_length = timer.currentStepLength();
+        auto stepReport = adaptiveTimeStepping_->stepConvergedTimestep(
+            timer,
+            *solver_,
+            convergedTimestepState_.event,
+            tuningUpdater,
+            convergedTimestepState_.current_time,
+            remaining_time,
+            convergedTimestepState_.converged_step_index,
+            convergedTimestepState_.converged_step_index == 0,
+            &converged_step_length
+        );
+        report_ += stepReport;
+        simulator_.problem().setSimulationReport(report_);
+
+        lastConvergedTimestepSize_ = converged_step_length;
+        ++convergedTimestepCount_;
+        convergedTimestepState_.current_time += converged_step_length;
+        ++convergedTimestepState_.converged_step_index;
+
+        const double eps = 1.0e-12 * std::max(1.0, std::abs(convergedTimestepState_.end_time));
+        if (convergedTimestepState_.current_time + eps < convergedTimestepState_.end_time) {
+            return true;
+        }
+
+        // write simulation state at the report stage
+        Dune::Timer perfTimer;
+        perfTimer.start();
+        const double nextstep = adaptiveTimeStepping_->suggestedNextStep();
+        simulator_.problem().setNextTimeStepSize(nextstep);
+        simulator_.problem().writeOutput(true);
+        report_.success.output_write_time += perfTimer.stop();
+
+        solver_->model().endReportStep();
+
+        // take time that was used to solve system for this reportStep
+        solverTimer_->stop();
+
+        // update timing.
+        report_.success.solver_time += solverTimer_->secsSinceStart();
+
+        if (this->grid().comm().rank() == 0) {
+            const auto& reps = this->solver_->model().stepReports();
+            convergence_output_.write(reps);
+        }
+
+        // Increment timer, remember well state.
+        ++timer;
+
+        if (terminalOutput_) {
+            std::string msg =
+                "Time step took " + std::to_string(solverTimer_->secsSinceStart()) + " seconds; "
+                "total solver time " + std::to_string(report_.success.solver_time) + " seconds.";
+            OpmLog::debug(msg);
+        }
+
+        serializer_.save(timer);
+        convergedTimestepState_ = ConvergedTimestepState{};
+
+        return true;
+    }
+
+    double lastConvergedTimestepSize() const
+    {
+        return lastConvergedTimestepSize_;
+    }
+
+    std::size_t convergedTimestepCount() const
+    {
+        return convergedTimestepCount_;
+    }
+
     SimulatorReport finalize()
     {
         // make sure all output is written to disk before run is finished
@@ -734,12 +974,23 @@ protected:
     // Misc. data
     bool terminalOutput_;
 
+    struct ConvergedTimestepState {
+        bool active{false};
+        bool event{false};
+        double current_time{0.0};
+        double end_time{0.0};
+        int converged_step_index{0};
+    };
+
     SimulatorReport report_;
     std::unique_ptr<time::StopWatch> solverTimer_;
     std::unique_ptr<time::StopWatch> totalTimer_;
     std::unique_ptr<TimeStepper> adaptiveTimeStepping_;
 
     SimulatorConvergenceOutput convergence_output_{};
+    ConvergedTimestepState convergedTimestepState_{};
+    double lastConvergedTimestepSize_{0.0};
+    std::size_t convergedTimestepCount_{0};
 
 #ifdef RESERVOIR_COUPLING_ENABLED
     bool slaveMode_{false};

@@ -239,6 +239,12 @@ private:
                          const double original_time_step,
                          const bool final_step);
 
+        SubStepIteration(SubStepper<Solver>& substepper,
+                         AdaptiveSimulatorTimer& substep_timer,
+                         const double original_time_step,
+                         const bool final_step,
+                         const bool stop_after_first_converged_substep);
+
         /// Run substeps until `substep_timer_` is done.  Returns the
         /// aggregated per-substep report.
         SimulatorReport run();
@@ -309,6 +315,7 @@ private:
         AdaptiveSimulatorTimer& substep_timer_;
         const double original_time_step_;
         const bool final_step_;
+        const bool stop_after_first_converged_substep_{false};
         std::string cause_of_failure_;
         AdaptiveTimeStepping<TypeTag>& adaptive_time_stepping_;
     };
@@ -364,6 +371,17 @@ public:
                          Solver& solver,
                          const bool is_event,
                          const TuningUpdateCallback& tuning_updater);
+
+    template <class Solver>
+    SimulatorReport stepConvergedTimestep(const SimulatorTimer& simulator_timer,
+                                          Solver& solver,
+                                          const bool is_event,
+                                          const TuningUpdateCallback& tuning_updater,
+                                          const double elapsed_time,
+                                          const double remaining_time,
+                                          const int converged_step_index,
+                                          const bool first_substep,
+                                          double* converged_step_length);
 
     /** \brief Apply TUNING keyword parameters.
      *
