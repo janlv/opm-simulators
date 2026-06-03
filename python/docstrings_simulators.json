@@ -68,6 +68,38 @@
             "signature_template": "opm.simulators.{{name}}.get_primary_variable(variable: str) -> NDArray[float]",
             "doc": "Retrieves the primary variable's values for the simulation grid.\n\n:param variable: The name of the variable. Valid names are 'pressure', 'water', 'gas', and 'brine'.\n:type variable: str\n\n:return: An array of primary variable values. See ``get_primary_variable_meaning()`` for more information.\n:type return: NDArray[float]"
         },
+        "availableLiveCellArrays": {
+            "signature_template": "opm.simulators.{{name}}.available_live_cell_arrays() -> tuple[str, ...]",
+            "doc": "Return names of cell arrays available from the current live simulator state.\n\n:return: Tuple of available live cell-array names.\n:type return: tuple[str, ...]"
+        },
+        "getActiveToGlobalCells": {
+            "signature_template": "opm.simulators.{{name}}.get_active_to_global_cells() -> NDArray[int]",
+            "doc": "Return one zero-based global Cartesian cell index per active simulator cell. The order matches live cell arrays returned by this API. MPI runs raise ``NotImplementedError``.\n\n:return: Zero-based global Cartesian cell indices.\n:type return: NDArray[int]"
+        },
+        "getLiveCellArray": {
+            "signature_template": "opm.simulators.{{name}}.get_live_cell_array(name: str) -> NDArray[float]",
+            "doc": "Return one live cell array by name. Supported names are reported by ``available_live_cell_arrays()``.\n\n:param name: Live cell-array name.\n:type name: str\n:return: Live cell-array values in active-cell order.\n:type return: NDArray[float]"
+        },
+        "getLiveCellArrays": {
+            "signature_template": "opm.simulators.{{name}}.get_live_cell_arrays(names: list[str]) -> dict[str, NDArray[float]]",
+            "doc": "Return several live cell arrays by name.\n\n:param names: Live cell-array names.\n:type names: list[str]\n:return: Mapping from requested names to active-cell arrays.\n:type return: dict[str, NDArray[float]]"
+        },
+        "getLiveWellTopology": {
+            "signature_template": "opm.simulators.{{name}}.get_live_well_topology() -> dict[str, object]",
+            "doc": "Return fixed live well and perforation topology from the current simulator state. ``perf_connxt`` is one-based within each well perforation slice, with ``0`` marking a root. MPI runs raise ``NotImplementedError``.\n\n:return: Mapping of live well-topology arrays.\n:type return: dict[str, object]"
+        },
+        "getLiveWellRates": {
+            "signature_template": "opm.simulators.{{name}}.get_live_well_rates() -> dict[str, object]",
+            "doc": "Return current live well and perforation water rates. Rates are water rates in surface and reservoir-volume frames; negative values denote injection into the reservoir and positive values denote production from the reservoir. MPI runs raise ``NotImplementedError``.\n\n:return: Mapping of live well-rate arrays.\n:type return: dict[str, object]"
+        },
+        "getLiveNncTopology": {
+            "signature_template": "opm.simulators.{{name}}.get_live_nnc_topology() -> dict[str, object]",
+            "doc": "Return fixed live NNC topology from the current simulator state. ``nnc1`` and ``nnc2`` are Eclipse-style one-based global cell numbers. MPI runs raise ``NotImplementedError``.\n\n:return: Mapping of fixed live NNC topology arrays.\n:type return: dict[str, object]"
+        },
+        "getLiveNncRates": {
+            "signature_template": "opm.simulators.{{name}}.get_live_nnc_rates() -> dict[str, object]",
+            "doc": "Return current live NNC reservoir water rates. ``water_reservoir_rate`` is ordered like ``get_live_nnc_topology()``; positive values mean flow from ``nnc1`` to ``nnc2``. MPI runs raise ``NotImplementedError``.\n\n:return: Mapping of live NNC rate arrays.\n:type return: dict[str, object]"
+        },
         "run": {
             "signature_template": "opm.simulators.{{name}}.run() -> int",
             "doc": "Runs the simulation to completion with the provided deck file or previously set deck.\n\n:return: EXIT_SUCCESS if the simulation completes successfully."

@@ -19,6 +19,7 @@
 
 #include "config.h"
 #include <opm/simulators/flow/python/PyBlackOilSimulator.hpp>
+#include <opm/simulators/flow/python/PyLiveReservoirData.hpp>
 // NOTE: This file will be generated at compile time and placed in the build directory
 // See python/generate_docstring_hpp.py, and python/simulators/CMakeLists.txt for details
 #include <PyBlackOilSimulatorDoc.hpp>
@@ -61,7 +62,7 @@ void export_PyBlackOilSimulator(py::module& m)
         "_BaseSimulatorBO",
         py::module_local()
     );
-    py::class_<PyBlackOilSimulator, PyBaseSimulator<TypeTag> >(m, "BlackOilSimulator")
+    auto cls = py::class_<PyBlackOilSimulator, PyBaseSimulator<TypeTag> >(m, "BlackOilSimulator")
         .def(py::init<const std::string&,
                       const std::vector<std::string>&>(),
              PyBlackOilSimulator_filename_constructor_docstring,
@@ -98,6 +99,7 @@ void export_PyBlackOilSimulator(py::module& m)
         .def("step", &PyBaseSimulator<TypeTag>::step, step_docstring)
         .def("step_cleanup", &PyBaseSimulator<TypeTag>::stepCleanup, stepCleanup_docstring)
         .def("step_init", &PyBaseSimulator<TypeTag>::stepInit, stepInit_docstring);
+    bindLiveReservoirData<TypeTag>(cls);
 }
 
 PYBIND11_MODULE(BlackOil, m)
