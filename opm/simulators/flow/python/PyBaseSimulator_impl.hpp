@@ -190,6 +190,7 @@ template<class TypeTag>
 int PyBaseSimulator<TypeTag>::stepCleanup()
 {
     this->has_run_cleanup_ = true;
+    this->live_reservoir_data_cache_.reset();
     return getFlowMain().executeStepsCleanup();
 }
 
@@ -205,6 +206,7 @@ int PyBaseSimulator<TypeTag>::stepInit()
             return EXIT_SUCCESS;
         }
     }
+    this->live_reservoir_data_cache_.reset();
     if (this->deck_) {
         this->main_ = std::make_unique<PyMain<TypeTag>>(
             this->deck_->getDataFile(),

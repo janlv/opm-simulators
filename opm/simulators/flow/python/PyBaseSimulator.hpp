@@ -27,6 +27,7 @@
 #include <opm/simulators/flow/python/PyFluidState.hpp>
 #include <opm/simulators/flow/python/PyMaterialState.hpp>
 #include <opm/simulators/flow/python/Pybind11Exporter.hpp>
+#include <opm/simulators/flow/python/PyLiveReservoirDataCache.hpp>
 
 #include <opm/input/eclipse/EclipseState/EclipseState.hpp>
 #include <opm/input/eclipse/EclipseState/SummaryConfig/SummaryConfig.hpp>
@@ -124,6 +125,7 @@ protected:
     std::shared_ptr<Schedule> schedule_{};
     std::shared_ptr<SummaryConfig> summary_config_{};
     std::vector<std::string> args_{};
+    PyLiveReservoirDataCache live_reservoir_data_cache_{};
 };  // class PyBaseSimulator
 
 }  // namespace Opm::Pybind

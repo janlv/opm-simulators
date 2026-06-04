@@ -28,6 +28,7 @@
 #include <opm/models/common/multiphasebaseproperties.hh>
 #include <opm/models/discretization/common/fvbaseproperties.hh>
 #include <opm/models/utils/basicproperties.hh>
+#include <opm/simulators/flow/python/PyLiveReservoirDataCache.hpp>
 
 #include <algorithm>
 #include <array>
@@ -77,6 +78,7 @@ inline py::tuple tupleFromStrings(const std::vector<std::string>& values)
     }
     return result;
 }
+
 
 inline void validateCompletionConnxt(const std::string& well_name,
                                      const std::vector<long long>& connxt)
@@ -225,15 +227,85 @@ struct PyLiveReservoirData
         }
     }
 
-    static py::dict getWaterReservoirFaceRateArrays(Base& self,
-                                                    const bool want_i,
-                                                    const bool want_j,
-                                                    const bool want_k)
+    static const std::vector<int>& activeToGlobalCellVector(Base& self)
     {
-        requireCompletedConvergedTimestep(self, "WATER_RESERVOIR_FACE_RATE_*");
-        if (!FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
+        auto& cache = self.live_reservoir_data_cache_;
+        if (cache.active_to_global_valid) {
+            return cache.active_to_global;
+        }
+
+        const auto num_dof = self.simulator_->model().numGridDof();
+        const auto& ecl_state = self.simulator_->vanguard().eclState();
+        const auto& input_grid = ecl_state.getInputGrid();
+        const auto& input_actnum = input_grid.getACTNUM();
+        const auto global_porv = ecl_state.fieldProps().porv(true);
+
+        cache.active_to_global.clear();
+        cache.active_to_global.reserve(num_dof);
+        const auto nx = input_grid.getNX();
+        const auto ny = input_grid.getNY();
+        for (std::size_t global_cell = 0; global_cell < input_actnum.size(); ++global_cell) {
+            if (input_actnum[global_cell] == 0) {
+                continue;
+            }
+            const auto i = global_cell % nx;
+            const auto j = (global_cell / nx) % ny;
+            const auto k = global_cell / (nx * ny);
+            if (input_grid.cellActiveAfterMINPV(i, j, k, global_porv[global_cell])) {
+                cache.active_to_global.push_back(static_cast<int>(global_cell));
+            }
+        }
+
+        if (cache.active_to_global.size() != static_cast<std::size_t>(num_dof)) {
+            throw std::runtime_error("Reconstructed active-cell map does not match live simulator arrays.");
+        }
+        if (std::unordered_set<int>(cache.active_to_global.begin(), cache.active_to_global.end()).size()
+            != cache.active_to_global.size()) {
+            throw std::runtime_error("Reconstructed active-cell map contains duplicate cells.");
+        }
+        cache.active_to_global_valid = true;
+        return cache.active_to_global;
+    }
+
+    static PyLiveReservoirDataCache& liveNncTopologyCache(Base& self)
+    {
+        auto& cache = self.live_reservoir_data_cache_;
+        if (cache.nnc_topology_valid) {
+            return cache;
+        }
+
+        const auto& output_nnc = self.simulator_->problem().eclWriter().getOutputNnc();
+        if (output_nnc.size() > 1) {
             LiveReservoirDataDetail::raisePythonError(
-                PyExc_KeyError, "Water phase is inactive for reservoir face-rate export.");
+                PyExc_NotImplementedError,
+                "Live NNC export currently supports only main-grid NNC data.");
+        }
+
+        cache.nnc_pairs.clear();
+        cache.nnc_output_index.clear();
+        if (!output_nnc.empty()) {
+            const auto& main_grid_nnc = output_nnc.front();
+            cache.nnc_pairs.reserve(main_grid_nnc.size());
+            cache.nnc_output_index.reserve(main_grid_nnc.size());
+            for (std::size_t index = 0; index < main_grid_nnc.size(); ++index) {
+                const auto pair = LiveReservoirCellPair{
+                    main_grid_nnc[index].cell1,
+                    main_grid_nnc[index].cell2,
+                };
+                cache.nnc_pairs.push_back(pair);
+                cache.nnc_output_index[pair].push_back(index);
+            }
+        }
+        cache.nnc_topology_valid = true;
+        return cache;
+    }
+
+    static const PyLiveReservoirDataCache& ensureWaterFluxCache(Base& self)
+    {
+        auto& cache = liveNncTopologyCache(self);
+        const auto current_step = static_cast<std::size_t>(self.getFlowMain().getConvergedTimestepCount());
+        if (cache.water_flux_valid && cache.water_flux_step == current_step) {
+            return cache;
         }
 
         const int x_face_id = FaceDir::ToIntersectionIndex(FaceDir::DirEnum::XPlus);
@@ -243,9 +315,12 @@ struct PyLiveReservoirData
         using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
         const auto& simulator = *self.simulator_;
         const auto num_dof = simulator.model().numGridDof();
-        std::vector<double> flow_i(want_i ? num_dof : 0, 0.0);
-        std::vector<double> flow_j(want_j ? num_dof : 0, 0.0);
-        std::vector<double> flow_k(want_k ? num_dof : 0, 0.0);
+        cache.water_face_i.assign(num_dof, 0.0);
+        cache.water_face_j.assign(num_dof, 0.0);
+        cache.water_face_k.assign(num_dof, 0.0);
+        cache.nnc_water_reservoir_rate.assign(cache.nnc_pairs.size(), 0.0);
+
+        const auto& active_to_global = activeToGlobalCellVector(self);
         ElementContext elem_ctx(simulator);
         constexpr auto time_idx = 0u;
 
@@ -257,39 +332,74 @@ struct PyLiveReservoirData
             const auto& stencil = elem_ctx.stencil(time_idx);
             for (unsigned scvf_idx = 0; scvf_idx < elem_ctx.numInteriorFaces(time_idx); ++scvf_idx) {
                 const auto& face = stencil.interiorFace(scvf_idx);
+                const auto interior_dof = elem_ctx.globalSpaceIndex(face.interiorIndex(), time_idx);
+                const auto& ext_quants = elem_ctx.extensiveQuantities(scvf_idx, time_idx);
+                const auto alpha = getValue(ext_quants.extrusionFactor()) * face.area();
+                const auto face_rate = alpha * getValue(ext_quants.volumeFlux(FluidSystem::waterPhaseIdx));
+
                 const auto dir_id = face.dirId();
-                if (!((want_i && dir_id == x_face_id) ||
-                      (want_j && dir_id == y_face_id) ||
-                      (want_k && dir_id == z_face_id))) {
+                if (dir_id == x_face_id) {
+                    cache.water_face_i[interior_dof] = face_rate;
+                }
+                else if (dir_id == y_face_id) {
+                    cache.water_face_j[interior_dof] = face_rate;
+                }
+                else if (dir_id == z_face_id) {
+                    cache.water_face_k[interior_dof] = face_rate;
+                }
+
+                if (cache.nnc_output_index.empty()) {
                     continue;
                 }
 
-                const auto global_dof_idx = elem_ctx.globalSpaceIndex(face.interiorIndex(), time_idx);
-                const auto& ext_quants = elem_ctx.extensiveQuantities(scvf_idx, time_idx);
-                const auto alpha = getValue(ext_quants.extrusionFactor()) * face.area();
-                const auto value = alpha * getValue(ext_quants.volumeFlux(FluidSystem::waterPhaseIdx));
+                const auto exterior_dof = elem_ctx.globalSpaceIndex(face.exteriorIndex(), time_idx);
+                if (interior_dof >= active_to_global.size() || exterior_dof >= active_to_global.size()) {
+                    throw std::runtime_error("Live NNC face references an out-of-range active cell.");
+                }
 
-                if (want_i && dir_id == x_face_id) {
-                    flow_i[global_dof_idx] = value;
+                const auto interior_global = static_cast<std::size_t>(active_to_global[interior_dof]);
+                const auto exterior_global = static_cast<std::size_t>(active_to_global[exterior_dof]);
+                const auto lower_global = std::min(interior_global, exterior_global);
+                const auto upper_global = std::max(interior_global, exterior_global);
+                const auto entry = cache.nnc_output_index.find(
+                    LiveReservoirCellPair{lower_global, upper_global});
+                if (entry == cache.nnc_output_index.end()) {
+                    continue;
                 }
-                else if (want_j && dir_id == y_face_id) {
-                    flow_j[global_dof_idx] = value;
-                }
-                else if (want_k && dir_id == z_face_id) {
-                    flow_k[global_dof_idx] = value;
+
+                const auto signed_rate = (interior_global == lower_global) ? face_rate : -face_rate;
+                for (const auto index : entry->second) {
+                    cache.nnc_water_reservoir_rate[index] = signed_rate;
                 }
             }
         }
 
+        cache.water_flux_step = current_step;
+        cache.water_flux_valid = true;
+        return cache;
+    }
+
+    static py::dict getWaterReservoirFaceRateArrays(Base& self,
+                                                    const bool want_i,
+                                                    const bool want_j,
+                                                    const bool want_k)
+    {
+        requireCompletedConvergedTimestep(self, "WATER_RESERVOIR_FACE_RATE_*");
+        if (!FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
+            LiveReservoirDataDetail::raisePythonError(
+                PyExc_KeyError, "Water phase is inactive for reservoir face-rate export.");
+        }
+
+        const auto& cache = ensureWaterFluxCache(self);
         py::dict result;
         if (want_i) {
-            result["WATER_RESERVOIR_FACE_RATE_I+"] = LiveReservoirDataDetail::copyToArray(flow_i);
+            result["WATER_RESERVOIR_FACE_RATE_I+"] = LiveReservoirDataDetail::copyToArray(cache.water_face_i);
         }
         if (want_j) {
-            result["WATER_RESERVOIR_FACE_RATE_J+"] = LiveReservoirDataDetail::copyToArray(flow_j);
+            result["WATER_RESERVOIR_FACE_RATE_J+"] = LiveReservoirDataDetail::copyToArray(cache.water_face_j);
         }
         if (want_k) {
-            result["WATER_RESERVOIR_FACE_RATE_K+"] = LiveReservoirDataDetail::copyToArray(flow_k);
+            result["WATER_RESERVOIR_FACE_RATE_K+"] = LiveReservoirDataDetail::copyToArray(cache.water_face_k);
         }
         return result;
     }
@@ -299,36 +409,7 @@ struct PyLiveReservoirData
         requireInitialized(self, "get_active_to_global_cells");
         requireSerial(self, "get_active_to_global_cells");
 
-        const auto num_dof = self.simulator_->model().numGridDof();
-        const auto& ecl_state = self.simulator_->vanguard().eclState();
-        const auto& input_grid = ecl_state.getInputGrid();
-        const auto& input_actnum = input_grid.getACTNUM();
-        const auto global_porv = ecl_state.fieldProps().porv(true);
-
-        std::vector<int> active_to_global;
-        active_to_global.reserve(num_dof);
-        const auto nx = input_grid.getNX();
-        const auto ny = input_grid.getNY();
-        for (std::size_t global_cell = 0; global_cell < input_actnum.size(); ++global_cell) {
-            if (input_actnum[global_cell] == 0) {
-                continue;
-            }
-            const auto i = global_cell % nx;
-            const auto j = (global_cell / nx) % ny;
-            const auto k = global_cell / (nx * ny);
-            if (input_grid.cellActiveAfterMINPV(i, j, k, global_porv[global_cell])) {
-                active_to_global.push_back(static_cast<int>(global_cell));
-            }
-        }
-
-        if (active_to_global.size() != static_cast<std::size_t>(num_dof)) {
-            throw std::runtime_error("Reconstructed active-cell map does not match live simulator arrays.");
-        }
-        if (std::unordered_set<int>(active_to_global.begin(), active_to_global.end()).size()
-            != active_to_global.size()) {
-            throw std::runtime_error("Reconstructed active-cell map contains duplicate cells.");
-        }
-
+        const auto& active_to_global = activeToGlobalCellVector(self);
         auto values = LiveReservoirDataDetail::makeArray<long long>(active_to_global.size());
         auto values_mut = values.template mutable_unchecked<1>();
         for (std::size_t active_index = 0; active_index < active_to_global.size(); ++active_index) {
@@ -626,25 +707,15 @@ struct PyLiveReservoirData
         requireInitialized(self, "get_live_nnc_topology");
         requireSerial(self, "get_live_nnc_topology");
 
-        const auto& output_nnc = self.simulator_->problem().eclWriter().getOutputNnc();
-        if (output_nnc.size() > 1) {
-            LiveReservoirDataDetail::raisePythonError(
-                PyExc_NotImplementedError,
-                "get_live_nnc_topology() currently exports only main-grid NNC topology.");
-        }
-
-        const auto num_nnc = output_nnc.empty() ? 0 : output_nnc.front().size();
-        auto nnc1 = LiveReservoirDataDetail::makeArray<long long>(num_nnc);
-        auto nnc2 = LiveReservoirDataDetail::makeArray<long long>(num_nnc);
+        const auto& cache = liveNncTopologyCache(self);
+        auto nnc1 = LiveReservoirDataDetail::makeArray<long long>(cache.nnc_pairs.size());
+        auto nnc2 = LiveReservoirDataDetail::makeArray<long long>(cache.nnc_pairs.size());
         auto nnc1_mut = nnc1.template mutable_unchecked<1>();
         auto nnc2_mut = nnc2.template mutable_unchecked<1>();
 
-        if (!output_nnc.empty()) {
-            const auto& main_grid_nnc = output_nnc.front();
-            for (std::size_t index = 0; index < main_grid_nnc.size(); ++index) {
-                nnc1_mut(index) = static_cast<long long>(main_grid_nnc[index].cell1) + 1;
-                nnc2_mut(index) = static_cast<long long>(main_grid_nnc[index].cell2) + 1;
-            }
+        for (std::size_t index = 0; index < cache.nnc_pairs.size(); ++index) {
+            nnc1_mut(index) = static_cast<long long>(cache.nnc_pairs[index].first) + 1;
+            nnc2_mut(index) = static_cast<long long>(cache.nnc_pairs[index].second) + 1;
         }
 
         py::dict result;
@@ -657,48 +728,19 @@ struct PyLiveReservoirData
     {
         requireInitialized(self, "get_live_nnc_rates");
         requireSerial(self, "get_live_nnc_rates");
+        requireCompletedConvergedTimestep(self, "Live NNC reservoir water rates");
         if (!FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
             LiveReservoirDataDetail::raisePythonError(
                 PyExc_KeyError, "Live NNC water-rate export requires an active water phase.");
         }
 
-        const auto& output_nnc = self.simulator_->problem().eclWriter().getOutputNnc();
-        if (output_nnc.size() > 1) {
-            LiveReservoirDataDetail::raisePythonError(
-                PyExc_NotImplementedError,
-                "get_live_nnc_rates() currently exports only main-grid NNC rates.");
-        }
-
-        const auto num_nnc = output_nnc.empty() ? 0 : output_nnc.front().size();
-        auto water_reservoir_rate = LiveReservoirDataDetail::makeArray<double>(num_nnc);
-        auto water_reservoir_rate_mut = water_reservoir_rate.template mutable_unchecked<1>();
-
-        if (num_nnc > 0) {
-            const auto& flows = self.simulator_->problem().eclWriter().outputModule().getFlows();
-            if (!flows.hasFloresn()) {
-                LiveReservoirDataDetail::raisePythonError(
-                    PyExc_KeyError, "Live NNC reservoir water rates require active FLORESN output data.");
-            }
-            const auto& floresn = flows.getFloresn();
-            const auto water = std::find_if(floresn.begin(), floresn.end(), [](const auto& values) {
-                return values.name == "FLRWATN+";
-            });
-            if (water == floresn.end() || water->values.empty()) {
-                LiveReservoirDataDetail::raisePythonError(
-                    PyExc_KeyError, "Live NNC reservoir water rates require FLRWATN+ values.");
-            }
-            if (water->values.size() != num_nnc) {
-                throw std::runtime_error("FLRWATN+ length does not match fixed live NNC topology.");
-            }
-            for (std::size_t index = 0; index < num_nnc; ++index) {
-                water_reservoir_rate_mut(index) = water->values[index];
-            }
-        }
-
+        const auto& cache = ensureWaterFluxCache(self);
         py::dict result;
-        result["water_reservoir_rate"] = water_reservoir_rate;
+        result["water_reservoir_rate"] =
+            LiveReservoirDataDetail::copyToArray(cache.nnc_water_reservoir_rate);
         return result;
     }
+
 };
 
 template<class TypeTag, class PyClass>
