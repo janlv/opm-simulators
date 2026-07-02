@@ -202,6 +202,13 @@ struct PyLiveReservoirData
                name == "WATER_RESERVOIR_FACE_RATE_K+";
     }
 
+    static bool isWaterSurfaceFaceRateName(const std::string& name)
+    {
+        return name == "WATER_SURFACE_FACE_RATE_I+" ||
+               name == "WATER_SURFACE_FACE_RATE_J+" ||
+               name == "WATER_SURFACE_FACE_RATE_K+";
+    }
+
     static void requireInitialized(const Base& self, const std::string& method)
     {
         if (!self.has_run_init_ || self.simulator_ == nullptr) {
@@ -318,7 +325,11 @@ struct PyLiveReservoirData
         cache.water_face_i.assign(num_dof, 0.0);
         cache.water_face_j.assign(num_dof, 0.0);
         cache.water_face_k.assign(num_dof, 0.0);
+        cache.water_surface_face_i.assign(num_dof, 0.0);
+        cache.water_surface_face_j.assign(num_dof, 0.0);
+        cache.water_surface_face_k.assign(num_dof, 0.0);
         cache.nnc_water_reservoir_rate.assign(cache.nnc_pairs.size(), 0.0);
+        cache.nnc_water_surface_rate.assign(cache.nnc_pairs.size(), 0.0);
 
         const auto& active_to_global = activeToGlobalCellVector(self);
         ElementContext elem_ctx(simulator);
@@ -336,16 +347,26 @@ struct PyLiveReservoirData
                 const auto& ext_quants = elem_ctx.extensiveQuantities(scvf_idx, time_idx);
                 const auto alpha = getValue(ext_quants.extrusionFactor()) * face.area();
                 const auto face_rate = alpha * getValue(ext_quants.volumeFlux(FluidSystem::waterPhaseIdx));
+                const auto upstream_dof = ext_quants.upstreamIndex(FluidSystem::waterPhaseIdx);
+                const auto& upstream_quants = elem_ctx.intensiveQuantities(upstream_dof, time_idx);
+                const auto inv_b = getValue(upstream_quants.fluidState().invB(FluidSystem::waterPhaseIdx));
+                // Surface-equivalent rates are black-oil standard-volume water rates, not
+                // physical surface-condition flow. OPM's native water tracers transport this
+                // conserved water component as reservoir flux multiplied by upstream 1/Bw.
+                const auto surface_face_rate = face_rate * inv_b;
 
                 const auto dir_id = face.dirId();
                 if (dir_id == x_face_id) {
                     cache.water_face_i[interior_dof] = face_rate;
+                    cache.water_surface_face_i[interior_dof] = surface_face_rate;
                 }
                 else if (dir_id == y_face_id) {
                     cache.water_face_j[interior_dof] = face_rate;
+                    cache.water_surface_face_j[interior_dof] = surface_face_rate;
                 }
                 else if (dir_id == z_face_id) {
                     cache.water_face_k[interior_dof] = face_rate;
+                    cache.water_surface_face_k[interior_dof] = surface_face_rate;
                 }
 
                 if (cache.nnc_output_index.empty()) {
@@ -368,8 +389,11 @@ struct PyLiveReservoirData
                 }
 
                 const auto signed_rate = (interior_global == lower_global) ? face_rate : -face_rate;
+                const auto signed_surface_rate =
+                    (interior_global == lower_global) ? surface_face_rate : -surface_face_rate;
                 for (const auto index : entry->second) {
                     cache.nnc_water_reservoir_rate[index] = signed_rate;
+                    cache.nnc_water_surface_rate[index] = signed_surface_rate;
                 }
             }
         }
@@ -404,6 +428,81 @@ struct PyLiveReservoirData
         return result;
     }
 
+    static py::dict getWaterSurfaceFaceRateArrays(Base& self,
+                                                  const bool want_i,
+                                                  const bool want_j,
+                                                  const bool want_k)
+    {
+        requireCompletedConvergedTimestep(self, "WATER_SURFACE_FACE_RATE_*");
+        if (!FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
+            LiveReservoirDataDetail::raisePythonError(
+                PyExc_KeyError, "Water phase is inactive for surface-equivalent face-rate export.");
+        }
+
+        const auto& cache = ensureWaterFluxCache(self);
+        py::dict result;
+        if (want_i) {
+            result["WATER_SURFACE_FACE_RATE_I+"] = LiveReservoirDataDetail::copyToArray(cache.water_surface_face_i);
+        }
+        if (want_j) {
+            result["WATER_SURFACE_FACE_RATE_J+"] = LiveReservoirDataDetail::copyToArray(cache.water_surface_face_j);
+        }
+        if (want_k) {
+            result["WATER_SURFACE_FACE_RATE_K+"] = LiveReservoirDataDetail::copyToArray(cache.water_surface_face_k);
+        }
+        return result;
+    }
+
+    static py::array_t<double> getDynamicPoreVolumeArray(Base& self)
+    {
+        requireInitialized(self, "RPORV");
+
+        using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
+        const auto& simulator = *self.simulator_;
+        const auto num_dof = simulator.model().numGridDof();
+        std::vector<double> rporv(num_dof, 0.0);
+        ElementContext elem_ctx(simulator);
+        constexpr auto time_idx = 0u;
+        for (const auto& elem : elements(simulator.gridView())) {
+            elem_ctx.updatePrimaryStencil(elem);
+            elem_ctx.updatePrimaryIntensiveQuantities(time_idx);
+            for (unsigned dof_idx = 0; dof_idx < elem_ctx.numPrimaryDof(time_idx); ++dof_idx) {
+                const auto global_dof_idx = elem_ctx.globalSpaceIndex(dof_idx, time_idx);
+                const auto porosity = getValue(elem_ctx.intensiveQuantities(dof_idx, time_idx).porosity());
+                // Keep live RPORV aligned with OPM's report/output path. For compressible
+                // rock, OPM's tracer storage uses dynamic intensive-quantity porosity, not
+                // the static input porosity exposed through PyMaterialState.
+                rporv[global_dof_idx] = simulator.model().dofTotalVolume(global_dof_idx) * porosity;
+            }
+        }
+        return LiveReservoirDataDetail::copyToArray(rporv);
+    }
+
+    static py::array_t<double> getWaterInverseFormationVolumeFactorArray(Base& self)
+    {
+        requireInitialized(self, "1OVERBW");
+        if (!FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
+            LiveReservoirDataDetail::raisePythonError(PyExc_KeyError, "Water phase is inactive.");
+        }
+
+        using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
+        const auto& simulator = *self.simulator_;
+        const auto num_dof = simulator.model().numGridDof();
+        std::vector<double> inv_b(num_dof, 0.0);
+        ElementContext elem_ctx(simulator);
+        constexpr auto time_idx = 0u;
+        for (const auto& elem : elements(simulator.gridView())) {
+            elem_ctx.updatePrimaryStencil(elem);
+            elem_ctx.updatePrimaryIntensiveQuantities(time_idx);
+            for (unsigned dof_idx = 0; dof_idx < elem_ctx.numPrimaryDof(time_idx); ++dof_idx) {
+                const auto global_dof_idx = elem_ctx.globalSpaceIndex(dof_idx, time_idx);
+                const auto& fs = elem_ctx.intensiveQuantities(dof_idx, time_idx).fluidState();
+                inv_b[global_dof_idx] = getValue(fs.invB(FluidSystem::waterPhaseIdx));
+            }
+        }
+        return LiveReservoirDataDetail::copyToArray(inv_b);
+    }
+
     static py::array_t<long long> getActiveToGlobalCells(Base& self)
     {
         requireInitialized(self, "get_active_to_global_cells");
@@ -424,10 +523,14 @@ struct PyLiveReservoirData
         std::vector<std::string> names{"RPORV", "PRESSURE"};
         if (FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
             names.push_back("SWAT");
+            names.push_back("1OVERBW");
             if (hasCompletedConvergedTimestep(self)) {
                 names.push_back("WATER_RESERVOIR_FACE_RATE_I+");
                 names.push_back("WATER_RESERVOIR_FACE_RATE_J+");
                 names.push_back("WATER_RESERVOIR_FACE_RATE_K+");
+                names.push_back("WATER_SURFACE_FACE_RATE_I+");
+                names.push_back("WATER_SURFACE_FACE_RATE_J+");
+                names.push_back("WATER_SURFACE_FACE_RATE_K+");
             }
         }
         if (FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
@@ -444,16 +547,7 @@ struct PyLiveReservoirData
     {
         requireInitialized(self, "get_live_cell_array");
         if (name == "RPORV") {
-            const auto porosity = self.getMaterialState().getPorosity();
-            const auto volumes = self.getMaterialState().getCellVolumes();
-            if (porosity.size() != volumes.size()) {
-                throw std::runtime_error("Porosity and cell-volume array sizes differ for RPORV export.");
-            }
-            std::vector<double> rporv(porosity.size(), 0.0);
-            for (std::size_t index = 0; index < rporv.size(); ++index) {
-                rporv[index] = porosity[index] * volumes[index];
-            }
-            return LiveReservoirDataDetail::copyToArray(rporv);
+            return getDynamicPoreVolumeArray(self);
         }
         if (name == "SWAT") {
             if (!FluidSystem::phaseIsActive(FluidSystem::waterPhaseIdx)) {
@@ -461,6 +555,9 @@ struct PyLiveReservoirData
             }
             return LiveReservoirDataDetail::copyToArray(
                 self.getFluidState().getFluidStateVariable("Sw"));
+        }
+        if (name == "1OVERBW") {
+            return getWaterInverseFormationVolumeFactorArray(self);
         }
         if (name == "SGAS") {
             if (!FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
@@ -502,6 +599,14 @@ struct PyLiveReservoirData
                 name == "WATER_RESERVOIR_FACE_RATE_K+");
             return arrays[py::str(name)].template cast<py::array_t<double>>();
         }
+        if (isWaterSurfaceFaceRateName(name)) {
+            const auto arrays = getWaterSurfaceFaceRateArrays(
+                self,
+                name == "WATER_SURFACE_FACE_RATE_I+",
+                name == "WATER_SURFACE_FACE_RATE_J+",
+                name == "WATER_SURFACE_FACE_RATE_K+");
+            return arrays[py::str(name)].template cast<py::array_t<double>>();
+        }
         LiveReservoirDataDetail::raisePythonError(
             PyExc_KeyError,
             "Unknown live cell array: " + name);
@@ -511,33 +616,57 @@ struct PyLiveReservoirData
     static py::dict getLiveCellArrays(Base& self, const std::vector<std::string>& names)
     {
         py::dict result;
-        bool want_i = false;
-        bool want_j = false;
-        bool want_k = false;
+        bool want_res_i = false;
+        bool want_res_j = false;
+        bool want_res_k = false;
+        bool want_surf_i = false;
+        bool want_surf_j = false;
+        bool want_surf_k = false;
         for (const auto& name : names) {
             if (name == "WATER_RESERVOIR_FACE_RATE_I+") {
-                want_i = true;
+                want_res_i = true;
             }
             else if (name == "WATER_RESERVOIR_FACE_RATE_J+") {
-                want_j = true;
+                want_res_j = true;
             }
             else if (name == "WATER_RESERVOIR_FACE_RATE_K+") {
-                want_k = true;
+                want_res_k = true;
+            }
+            else if (name == "WATER_SURFACE_FACE_RATE_I+") {
+                want_surf_i = true;
+            }
+            else if (name == "WATER_SURFACE_FACE_RATE_J+") {
+                want_surf_j = true;
+            }
+            else if (name == "WATER_SURFACE_FACE_RATE_K+") {
+                want_surf_k = true;
             }
             else {
                 result[py::str(name)] = getLiveCellArray(self, name);
             }
         }
-        if (want_i || want_j || want_k) {
-            const auto arrays = getWaterReservoirFaceRateArrays(self, want_i, want_j, want_k);
-            if (want_i) {
+        if (want_res_i || want_res_j || want_res_k) {
+            const auto arrays = getWaterReservoirFaceRateArrays(self, want_res_i, want_res_j, want_res_k);
+            if (want_res_i) {
                 result["WATER_RESERVOIR_FACE_RATE_I+"] = arrays["WATER_RESERVOIR_FACE_RATE_I+"];
             }
-            if (want_j) {
+            if (want_res_j) {
                 result["WATER_RESERVOIR_FACE_RATE_J+"] = arrays["WATER_RESERVOIR_FACE_RATE_J+"];
             }
-            if (want_k) {
+            if (want_res_k) {
                 result["WATER_RESERVOIR_FACE_RATE_K+"] = arrays["WATER_RESERVOIR_FACE_RATE_K+"];
+            }
+        }
+        if (want_surf_i || want_surf_j || want_surf_k) {
+            const auto arrays = getWaterSurfaceFaceRateArrays(self, want_surf_i, want_surf_j, want_surf_k);
+            if (want_surf_i) {
+                result["WATER_SURFACE_FACE_RATE_I+"] = arrays["WATER_SURFACE_FACE_RATE_I+"];
+            }
+            if (want_surf_j) {
+                result["WATER_SURFACE_FACE_RATE_J+"] = arrays["WATER_SURFACE_FACE_RATE_J+"];
+            }
+            if (want_surf_k) {
+                result["WATER_SURFACE_FACE_RATE_K+"] = arrays["WATER_SURFACE_FACE_RATE_K+"];
             }
         }
         return result;
@@ -738,6 +867,8 @@ struct PyLiveReservoirData
         py::dict result;
         result["water_reservoir_rate"] =
             LiveReservoirDataDetail::copyToArray(cache.nnc_water_reservoir_rate);
+        result["water_surface_rate"] =
+            LiveReservoirDataDetail::copyToArray(cache.nnc_water_surface_rate);
         return result;
     }
 
@@ -752,17 +883,17 @@ void bindLiveReservoirData(PyClass& cls)
         .def("available_live_cell_arrays", &Data::availableLiveCellArrays,
              "Return names of cell arrays available from the current live simulator state.")
         .def("get_live_cell_array", &Data::getLiveCellArray, py::arg("name"),
-             "Return one live cell array by name.")
+             "Return one live cell array by name; RPORV uses dynamic porosity.")
         .def("get_live_cell_arrays", &Data::getLiveCellArrays, py::arg("names"),
              "Return several live cell arrays by name.")
         .def("get_live_well_topology", &Data::getLiveWellTopology,
              "Return fixed live well and perforation topology.")
         .def("get_live_well_rates", &Data::getLiveWellRates,
-             "Return current live well and perforation water rates.")
+             "Return current live well reservoir and surface-equivalent water rates.")
         .def("get_live_nnc_topology", &Data::getLiveNncTopology,
              "Return fixed live NNC topology.")
         .def("get_live_nnc_rates", &Data::getLiveNncRates,
-             "Return current live NNC reservoir water rates.");
+             "Return current live NNC reservoir and surface-equivalent water rates.");
 }
 
 } // namespace Opm::Pybind

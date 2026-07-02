@@ -62,7 +62,11 @@ struct PyLiveReservoirDataCache
     std::vector<double> water_face_i{};
     std::vector<double> water_face_j{};
     std::vector<double> water_face_k{};
+    std::vector<double> water_surface_face_i{};
+    std::vector<double> water_surface_face_j{};
+    std::vector<double> water_surface_face_k{};
     std::vector<double> nnc_water_reservoir_rate{};
+    std::vector<double> nnc_water_surface_rate{};
 
     void reset()
     {
@@ -83,7 +87,11 @@ struct PyLiveReservoirDataCache
         water_face_i.clear();
         water_face_j.clear();
         water_face_k.clear();
+        water_surface_face_i.clear();
+        water_surface_face_j.clear();
+        water_surface_face_k.clear();
         nnc_water_reservoir_rate.clear();
+        nnc_water_surface_rate.clear();
     }
 };
 
