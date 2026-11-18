@@ -419,7 +419,10 @@ namespace Opm {
         // Output summary after simulation has completed
         void runSimulatorAfterSim_(SimulatorReport &report)
         {
-            if (simulator_->model().hasNlddSolver()) {
+            // Without a report step there is no nonlinear solver and no model to ask (the
+            // Python step_cleanup() right after step_init(), as after a failed set-up of
+            // the caller), and no NLDD statistics either.
+            if (simulator_->hasSolver() && simulator_->model().hasNlddSolver()) {
                 const auto& odir = eclState().getIOConfig().getOutputDir();
                 // Write the number of nonlinear iterations per cell to a file in ResInsight compatible format
                 simulator_->model().writeNonlinearIterationsPerCell(odir);

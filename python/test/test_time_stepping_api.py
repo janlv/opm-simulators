@@ -152,8 +152,7 @@ class TestTimeSteppingAPI(unittest.TestCase):
                 assert np.all(tranz[layer < 2] > 0.0)
                 assert np.all(tranz[layer == 2] == 0.0)
 
-                # Static array: unchanged after a converged timestep (which step_cleanup()
-                # also needs here).
+                # Static array: unchanged after a converged timestep.
                 assert sim.advance_converged_timestep()
                 assert np.array_equal(np.asarray(sim.get_live_cell_array("TRANZ")), tranz)
                 sim.step_cleanup()
@@ -166,6 +165,37 @@ class TestTimeSteppingAPI(unittest.TestCase):
                 text=True,
                 capture_output=True,
             )
+
+
+    def test_blackoil_step_cleanup_before_first_timestep(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            script = textwrap.dedent(f"""
+                from opm.simulators import BlackOilSimulator
+
+                sim = BlackOilSimulator(
+                    "SPE1CASE1.DATA",
+                    args=["--linear-solver=ilu0", "--output-dir={output_dir}"],
+                )
+                sim.setup_mpi(init=True, finalize=True)
+                sim.step_init()
+
+                # A caller whose own set-up fails after step_init() closes the session
+                # without having advanced it. No report step has run, so the nonlinear
+                # solver does not exist yet, and the cleanup must not need it.
+                assert sim.step_cleanup() == 0
+                print("step_cleanup returned")
+            """)
+            # A crash inside step_cleanup() ends the child with a signal, which check=True
+            # turns into a failure here.
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=self.data_dir_bo,
+                env=os.environ.copy(),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertIn("step_cleanup returned", result.stdout)
 
 
 if __name__ == "__main__":

@@ -878,6 +878,11 @@ public:
     const Model& model() const
     { return solver_->model(); }
 
+    /// Whether the nonlinear solver exists. The first report step creates it, so model()
+    /// must not be called on a simulator that was initialised and never stepped.
+    bool hasSolver() const
+    { return static_cast<bool>(solver_); }
+
 protected:
     //! \brief Load simulator state from hdf5 serializer.
     void loadState([[maybe_unused]] HDF5Serializer& serializer,
