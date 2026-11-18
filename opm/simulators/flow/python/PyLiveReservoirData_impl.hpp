@@ -21,9 +21,12 @@
 
 #include <dune/grid/common/rangegenerators.hh>
 
+#include <opm/input/eclipse/EclipseState/Aquifer/AquiferConfig.hpp>
+#include <opm/input/eclipse/EclipseState/Aquifer/NumericalAquifer/NumericalAquifers.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/FaceDir.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/NNC.hpp>
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
+#include <opm/input/eclipse/Units/UnitSystem.hpp>
 #include <opm/material/common/MathToolbox.hpp>
 #include <opm/models/common/multiphasebaseproperties.hh>
 #include <opm/models/discretization/common/fvbaseproperties.hh>
@@ -180,6 +183,36 @@ std::vector<long long> buildCompletionConnxt(const std::string& well_name,
 
     validateCompletionConnxt(well_name, connxt);
     return connxt;
+}
+
+// Restatement of directVerticalNeighbors() in opm/simulators/flow/EclGenericWriter_impl.hpp
+// (anonymous namespace, compiled only into EclGenericWriter.cpp, so not callable from here).
+// Two cells with Cartesian indices small < large are direct vertical neighbours when they share
+// (i, j), are more than one layer apart, and every Cartesian cell between them is inactive.
+// `cartesianActive` is indexed by Cartesian cell and is nonzero for cells of the simulator grid
+// (the writer's levelCartToLevelCompressed lookup). Keep the two in step.
+inline bool directVerticalNeighbors(const std::size_t nx,
+                                    const std::size_t ny,
+                                    const std::vector<char>& cartesianActive,
+                                    const std::size_t smallGlobalIndex,
+                                    const std::size_t largeGlobalIndex)
+{
+    const auto layer = nx * ny;
+    const auto i1 = smallGlobalIndex % nx;
+    const auto j1 = (smallGlobalIndex / nx) % ny;
+    const auto k1 = smallGlobalIndex / layer;
+    const auto i2 = largeGlobalIndex % nx;
+    const auto j2 = (largeGlobalIndex / nx) % ny;
+    const auto k2 = largeGlobalIndex / layer;
+    if (i1 != i2 || j1 != j2 || k2 <= k1 + 1) {
+        return false;
+    }
+    for (auto gi = smallGlobalIndex + layer; gi < largeGlobalIndex; gi += layer) {
+        if (cartesianActive[gi] != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace LiveReservoirDataDetail
@@ -503,6 +536,97 @@ struct PyLiveReservoirData
         return LiveReservoirDataDetail::copyToArray(inv_b);
     }
 
+    // Static Z transmissibility per active cell, the value OPM writes as INIT TRANZ.
+    //
+    // This restates the TRANZ branch of EclGenericWriter::computeTrans_() in
+    // opm/simulators/flow/EclGenericWriter_impl.hpp for the level-zero grid of a serial run;
+    // keep the two in step. The writer's rule, per connection between two grid cells:
+    //   - only intersections with a neighbour on the same grid level, each pair once (c1 < c2);
+    //   - connections touching a numerical aquifer cell are skipped (they are NNCs on output);
+    //   - with Cartesian indices min < max: max - min == 1 (nx > 1) is TRANX and
+    //     max - min == nx (ny > 1) is TRANY, both skipped here; max - min == nx*ny, or the same
+    //     (i, j) with only inactive Cartesian cells between them (directVerticalNeighbors), is
+    //     the Z connection, stored at the cell with the smaller Cartesian index (the upper
+    //     cell). Every other active cell stays 0 (bottom layer, no active cell below, fault or
+    //     other non-neighbour connections, which the writer exports as NNCs instead).
+    // The transmissibility is the simulator's own for the pair: in serial runs the writer's
+    // globalTrans() is this same problem().eclTransmissibilities() object (FlowProblemBlackoil::
+    // finishInit), which stays populated for the whole run (only the vanguard's global copy is
+    // released). Values are converted from SI to the deck unit system with
+    // UnitSystem::measure::transmissibility, as the output layer does for INIT, so the array is
+    // directly comparable with INIT TRANZ (which is single precision on file).
+    static py::array_t<double> getStaticTranzArray(Base& self)
+    {
+        requireInitialized(self, "TRANZ");
+        requireSerial(self, "TRANZ");
+
+        const auto& simulator = *self.simulator_;
+        const auto& grid_view = simulator.gridView();
+        const auto& elem_mapper = simulator.model().elementMapper();
+        const auto& trans = simulator.problem().eclTransmissibilities();
+        const auto& ecl_state = simulator.vanguard().eclState();
+        const auto& units = ecl_state.getUnits();
+        const auto& input_grid = ecl_state.getInputGrid();
+        const std::size_t nx = input_grid.getNX();
+        const std::size_t ny = input_grid.getNY();
+
+        // Element-mapper index == live dof index == position in active_to_global (the face-rate
+        // and NNC code above rely on the same identity); entries are Cartesian indices
+        // i + nx*(j + ny*k), increasing with the dof index.
+        const auto& active_to_global = activeToGlobalCellVector(self);
+        std::vector<char> cartesian_active(input_grid.getCartesianSize(), 0);
+        for (const auto global_cell : active_to_global) {
+            cartesian_active[static_cast<std::size_t>(global_cell)] = 1;
+        }
+
+        // Sorted Cartesian ids of numerical aquifer cells (the writer's isNumAquCell_()).
+        const auto num_aqu_cells = ecl_state.aquifer().hasNumericalAquifer()
+            ? ecl_state.aquifer().numericalAquifers().allAquiferCellIds()
+            : std::vector<std::size_t>{};
+        const auto is_num_aqu_cell = [&num_aqu_cells](const std::size_t cart_idx) {
+            return std::binary_search(num_aqu_cells.begin(), num_aqu_cells.end(), cart_idx);
+        };
+
+        std::vector<double> tranz(simulator.model().numGridDof(), 0.0);
+        for (const auto& elem : elements(grid_view)) {
+            for (const auto& is : intersections(grid_view, elem)) {
+                if (!is.neighbor()) {
+                    continue; // domain boundary
+                }
+                if (is.inside().level() != is.outside().level()) {
+                    continue; // the writer treats cross-level connections as NNCs
+                }
+                const auto c1 = static_cast<unsigned>(elem_mapper.index(is.inside()));
+                const auto c2 = static_cast<unsigned>(elem_mapper.index(is.outside()));
+                if (c1 > c2) {
+                    continue; // each connection once, as the writer does
+                }
+                const auto cart1 = static_cast<std::size_t>(active_to_global[c1]);
+                const auto cart2 = static_cast<std::size_t>(active_to_global[c2]);
+                if (is_num_aqu_cell(cart1) || is_num_aqu_cell(cart2)) {
+                    continue; // numerical aquifer connections are NNCs on output
+                }
+                const auto min_cart = std::min(cart1, cart2);
+                const auto max_cart = std::max(cart1, cart2);
+                if (max_cart - min_cart == 1 && nx > 1) {
+                    continue; // TRANX connection
+                }
+                if (max_cart - min_cart == nx && ny > 1) {
+                    continue; // TRANY connection
+                }
+                if (max_cart - min_cart == nx * ny ||
+                    LiveReservoirDataDetail::directVerticalNeighbors(
+                        nx, ny, cartesian_active, min_cart, max_cart)) {
+                    // TRANZ belongs to the upper cell (smaller Cartesian index, smaller k).
+                    const auto upper_dof = (cart1 == min_cart) ? c1 : c2;
+                    tranz[upper_dof] = units.from_si(UnitSystem::measure::transmissibility,
+                                                     trans.transmissibility(c1, c2));
+                }
+            }
+        }
+        return LiveReservoirDataDetail::copyToArray(tranz);
+    }
+
     static py::array_t<long long> getActiveToGlobalCells(Base& self)
     {
         requireInitialized(self, "get_active_to_global_cells");
@@ -540,6 +664,8 @@ struct PyLiveReservoirData
             names.push_back("SOIL");
         }
         names.push_back("TEMP");
+        // Static: readable from step_init() on, before any converged timestep.
+        names.push_back("TRANZ");
         return LiveReservoirDataDetail::tupleFromStrings(names);
     }
 
@@ -558,6 +684,9 @@ struct PyLiveReservoirData
         }
         if (name == "1OVERBW") {
             return getWaterInverseFormationVolumeFactorArray(self);
+        }
+        if (name == "TRANZ") {
+            return getStaticTranzArray(self);
         }
         if (name == "SGAS") {
             if (!FluidSystem::phaseIsActive(FluidSystem::gasPhaseIdx)) {
@@ -883,7 +1012,9 @@ void bindLiveReservoirData(PyClass& cls)
         .def("available_live_cell_arrays", &Data::availableLiveCellArrays,
              "Return names of cell arrays available from the current live simulator state.")
         .def("get_live_cell_array", &Data::getLiveCellArray, py::arg("name"),
-             "Return one live cell array by name; RPORV uses dynamic porosity.")
+             "Return one live cell array by name; RPORV uses dynamic porosity. TRANZ is the "
+             "static Z transmissibility of each active cell to the cell below (INIT TRANZ rule, "
+             "deck units, serial runs only), readable right after step_init().")
         .def("get_live_cell_arrays", &Data::getLiveCellArrays, py::arg("names"),
              "Return several live cell arrays by name.")
         .def("get_live_well_topology", &Data::getLiveWellTopology,

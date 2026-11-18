@@ -124,5 +124,49 @@ class TestTimeSteppingAPI(unittest.TestCase):
             )
 
 
+    def test_blackoil_static_tranz_after_step_init(self):
+        with tempfile.TemporaryDirectory() as output_dir:
+            script = textwrap.dedent(f"""
+                import numpy as np
+                from opm.simulators import BlackOilSimulator
+
+                sim = BlackOilSimulator(
+                    "SPE1CASE1.DATA",
+                    args=["--linear-solver=ilu0", "--output-dir={output_dir}"],
+                )
+                sim.setup_mpi(init=True, finalize=True)
+                sim.step_init()
+
+                # TRANZ is static: listed and readable before any converged timestep.
+                assert "TRANZ" in sim.available_live_cell_arrays()
+                tranz = np.asarray(sim.get_live_cell_array("TRANZ"), dtype=float)
+                batched = np.asarray(sim.get_live_cell_arrays(("TRANZ",))["TRANZ"], dtype=float)
+                cells = np.asarray(sim.get_active_to_global_cells())
+                assert tranz.size == cells.size > 0
+                assert np.array_equal(tranz, batched)
+                assert np.all(np.isfinite(tranz))
+                assert np.all(tranz >= 0.0)
+                # SPE1CASE1 is a fully active 10 x 10 x 3 grid: every cell above the bottom
+                # layer has a K+ connection, and the bottom layer has none.
+                layer = cells // 100
+                assert np.all(tranz[layer < 2] > 0.0)
+                assert np.all(tranz[layer == 2] == 0.0)
+
+                # Static array: unchanged after a converged timestep (which step_cleanup()
+                # also needs here).
+                assert sim.advance_converged_timestep()
+                assert np.array_equal(np.asarray(sim.get_live_cell_array("TRANZ")), tranz)
+                sim.step_cleanup()
+            """)
+            subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=self.data_dir_bo,
+                env=os.environ.copy(),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -70,7 +70,7 @@
         },
         "availableLiveCellArrays": {
             "signature_template": "opm.simulators.{{name}}.available_live_cell_arrays() -> tuple[str, ...]",
-            "doc": "Return names of cell arrays available from the current live simulator state. Water live arrays include reservoir-volume face rates, surface-equivalent black-oil water face rates, and ``1OVERBW`` when the water phase is active. Surface-equivalent means standard-volume water accounting, not physical surface-condition flow.\n\n:return: Tuple of available live cell-array names.\n:type return: tuple[str, ...]"
+            "doc": "Return names of cell arrays available from the current live simulator state. Water live arrays include reservoir-volume face rates, surface-equivalent black-oil water face rates, and ``1OVERBW`` when the water phase is active. Surface-equivalent means standard-volume water accounting, not physical surface-condition flow. ``TRANZ`` is static and always listed, also before the first converged timestep.\n\n:return: Tuple of available live cell-array names.\n:type return: tuple[str, ...]"
         },
         "getActiveToGlobalCells": {
             "signature_template": "opm.simulators.{{name}}.get_active_to_global_cells() -> NDArray[int]",
@@ -78,7 +78,7 @@
         },
         "getLiveCellArray": {
             "signature_template": "opm.simulators.{{name}}.get_live_cell_array(name: str) -> NDArray[float]",
-            "doc": "Return one live cell array by name. Supported names are reported by ``available_live_cell_arrays()``. ``WATER_SURFACE_FACE_RATE_*`` arrays are reservoir water fluxes multiplied by upstream ``1/Bw`` so they use OPM native tracer's black-oil standard-volume water frame; ``1OVERBW`` is the matching storage multiplier.\n\n:param name: Live cell-array name.\n:type name: str\n:return: Live cell-array values in active-cell order.\n:type return: NDArray[float]"
+            "doc": "Return one live cell array by name. Supported names are reported by ``available_live_cell_arrays()``. ``WATER_SURFACE_FACE_RATE_*`` arrays are reservoir water fluxes multiplied by upstream ``1/Bw`` so they use OPM native tracer's black-oil standard-volume water frame; ``1OVERBW`` is the matching storage multiplier. ``TRANZ`` is the static Z transmissibility of each active cell to the cell below it, following the rule OPM uses for INIT ``TRANZ`` (Cartesian K+ neighbour, or the next active cell of the same column across inactive layers, stored at the upper cell; 0 elsewhere), converted to the deck unit system so it is directly comparable with INIT ``TRANZ``. It is readable right after ``step_init()``; MPI runs raise ``NotImplementedError``.\n\n:param name: Live cell-array name.\n:type name: str\n:return: Live cell-array values in active-cell order.\n:type return: NDArray[float]"
         },
         "getLiveCellArrays": {
             "signature_template": "opm.simulators.{{name}}.get_live_cell_arrays(names: list[str]) -> dict[str, NDArray[float]]",
