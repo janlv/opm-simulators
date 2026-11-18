@@ -953,7 +953,11 @@ struct PyLiveReservoirData
 
             const auto& perf_data = ws.perf_data;
             for (std::size_t perf_index = 0; perf_index < perf_data.size(); ++perf_index, ++perf_offset) {
-                perf_rate_mut(perf_offset) =
+                // A shut well has no live well object, and the well state keeps its last
+                // perforation rates for one step after the shut, so the surface rate is zero
+                // here as the reservoir rate below is. A stopped well that still crossflows
+                // has a live well object and keeps its rates in both bases.
+                perf_rate_mut(perf_offset) = live_well == nullptr ? 0.0 :
                     -perf_data.phase_rates[perf_index * well_state.numPhases() + water_active_idx];
 
                 std::vector<Scalar> surface_rates_perf(well_state.numPhases(), 0.0);

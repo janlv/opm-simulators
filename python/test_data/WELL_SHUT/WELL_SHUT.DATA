@@ -1,0 +1,168 @@
+-- Small deck for the live Python API test
+-- test_blackoil_shut_well_completion_rates_zero (python/test/test_time_stepping_api.py).
+--
+-- Two zones of a single active row (cells I = 1..9 of J = 1, K = 1; the rest is inactive
+-- padding), separated by the inactive barrier cell I = 5. Zone A (I = 1..4, DX 1000 ft)
+-- is pressured by the water injector INJ in I = 1; zone B (I = 6..9, DX 5 ft) is drained
+-- by the BHP producer PROD in I = 9. The only paths from A to B are wells with
+-- completions in both zones:
+--   * XFLOW, an OPEN water injector (75 STB/d) completed in I = 4, 6 and 7, flows for three
+--     one-day report steps and is then closed with WELOPEN 'XFLOW' 'SHUT'.
+--   * STOPXF, a STOPped injector (zero rate) with crossflow allowed (WELSPECS item 10
+--     'YES'), completed in I = 3 and 8. It has no surface rate but carries water from zone
+--     A into zone B through the wellbore during the whole run.
+--
+-- Single-phase water in practice (SWAT 1); OIL and GAS are declared so that the three-phase
+-- BlackOilSimulator runs the deck. Derived from the two-zone crossflow deck of pyFlow's
+-- tests/test_crossflow_native_tracer_parity.py (tracers and output keywords dropped, STOPXF
+-- added).
+
+RUNSPEC
+
+TITLE
+   WELL SHUT - live completion rates of a shut well
+
+DIMENS
+   9  2  2 /
+
+OIL
+WATER
+GAS
+
+FIELD
+
+TABDIMS
+    1    1   20   20    1   20  /
+
+REGDIMS
+    1    1    0    0  /
+
+WELLDIMS
+   4  3  1  4 /
+
+START
+    1 'JAN' 2020 /
+
+UNIFOUT
+
+GRID
+INIT
+
+DXV
+   1000  1000  1000  1000  5  5  5  5  5 /
+
+DYV
+   2*100 /
+
+DZ
+   36*10 /
+
+TOPS
+   36*3000 /
+
+PORO
+   36*0.25 /
+
+PERMX
+   36*1000 /
+
+PERMY
+   36*1000 /
+
+PERMZ
+   36*1000 /
+
+-- Only the first row is active; I = 5 is the barrier between the zones.
+ACTNUM
+   1  1  1  1  0  1  1  1  1  27*0 /
+
+PROPS
+SWOF
+    0.10  0.0  0.90  0.0
+    0.20  0.0  0.80  0.0
+    0.90  1.0  0.00  0.0
+    1.00  1.0  0.00  0.0 /
+
+SGOF
+    0.00  0.0  0.90  0.0
+    0.60  1.0  0.00  0.0
+    0.80  1.0  0.00  0.0 /
+
+PVTW
+   3000  1.0  3.0E-06  0.35  0.0 /
+
+PVCDO
+   3000  1.0  1.0E-05  0.50  0.0 /
+
+PVDG
+     14.7  178.10  0.012
+   3000.0    1.20  0.017
+   6000.0    0.60  0.020 /
+
+DENSITY
+   49.10  65.00  0.060 /
+
+ROCK
+   3000  4.0E-06 /
+
+SOLUTION
+PRESSURE
+   36*3000 /
+
+SWAT
+   36*1.00 /
+
+SGAS
+   36*0.0 /
+
+SCHEDULE
+-- One host timestep per report step: initial and maximum step equal the report step.
+TUNING
+   1  1 /
+/
+/
+
+-- Item 10 'YES' allows crossflow in every well.
+WELSPECS
+   'INJ'     'G1'     1  1  3000  'WATER'  1*  1*  'STOP'  'YES' /
+   'PROD'    'G1'     9  1  3000  'WATER'  1*  1*  'STOP'  'YES' /
+   'XFLOW'   'G1'     4  1  3000  'WATER'  1*  1*  'STOP'  'YES' /
+   'STOPXF'  'G1'     3  1  3000  'WATER'  1*  1*  'STOP'  'YES' /
+/
+
+COMPDAT
+   'INJ'     1  1  1  1  'OPEN'  0  1*  0.5  1*  0  1*  'Z' /
+   'PROD'    9  1  1  1  'OPEN'  0  1*  0.5  1*  0  1*  'Z' /
+   'XFLOW'   4  1  1  1  'OPEN'  0  1*  0.5  1*  0  1*  'Z' /
+   'XFLOW'   6  1  1  1  'OPEN'  0  1*  0.5  1*  0  1*  'Z' /
+   'XFLOW'   7  1  1  1  'OPEN'  0  1*  0.5  1*  0  1*  'Z' /
+   'STOPXF'  3  1  1  1  'OPEN'  0  1*  0.5  1*  0  1*  'Z' /
+   'STOPXF'  8  1  1  1  'OPEN'  0  1*  0.5  1*  0  1*  'Z' /
+/
+
+COMPORD
+   'XFLOW'   INPUT /
+   'STOPXF'  INPUT /
+/
+
+WCONINJE
+   'INJ'     'WATER'  'OPEN'  'RATE'  150  1*  10000 /
+   'XFLOW'   'WATER'  'OPEN'  'RATE'  75   1*  10000 /
+   'STOPXF'  'WATER'  'STOP'  'RATE'  0.0  1*  10000 /
+/
+
+WCONPROD
+   'PROD'  'OPEN'  'BHP'  5*  2900 /
+/
+
+TSTEP
+   3*1 /
+
+WELOPEN
+   'XFLOW'  'SHUT' /
+/
+
+TSTEP
+   3*1 /
+
+END

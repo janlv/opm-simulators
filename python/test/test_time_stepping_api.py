@@ -376,5 +376,96 @@ class TestTimeSteppingAPI(unittest.TestCase):
             self.assertIn("largest balance residual", result.stdout)
 
 
+    def test_blackoil_shut_well_completion_rates_zero(self):
+        # A well without a live well object (a SHUT well) reports zero completion rates in
+        # both bases from the first converged step after the shut (see the comment in the
+        # perforation loop of getLiveWellRates in
+        # opm/simulators/flow/python/PyLiveReservoirData_impl.hpp). OPM's well state keeps
+        # the last perforation rates of a just-shut well for one step; before the fix the
+        # surface rates of that step were those stale values while the reservoir rates were 0.
+        # A STOPped well that crossflows still has a live well object and keeps its rates.
+        data_dir = Path(os.path.dirname(__file__)).parent.joinpath("test_data/WELL_SHUT")
+        with tempfile.TemporaryDirectory() as output_dir:
+            script = textwrap.dedent(f"""
+                import numpy as np
+                from opm.simulators import BlackOilSimulator
+
+                sim = BlackOilSimulator(
+                    "WELL_SHUT.DATA",
+                    args=["--linear-solver=ilu0", "--output-dir={output_dir}"],
+                )
+                sim.setup_mpi(init=True, finalize=True)
+                sim.step_init()
+
+                # WELL_SHUT: XFLOW (three completions across two zones) injects for three
+                # one-day report steps and is shut by WELOPEN at day 3; STOPXF is STOPped
+                # from the start and crossflows between its two completions. Rates are SI
+                # m3/s, positive into the well.
+                shut_seconds = 3 * 86400.0
+                # Measured with this deck: the smallest |completion rate| of a flowing well
+                # is 3.1e-5 m3/s (XFLOW at I = 4, day 3), the others 8e-5 to 5.3e-4 m3/s.
+                # The threshold lies three times below the smallest, so it only fails if a
+                # well has stopped flowing.
+                rate_threshold = 1.0e-5
+                elapsed = 0.0
+                steps_before = steps_after = 0
+                while not sim.check_simulation_finished():
+                    assert sim.advance_converged_timestep()
+                    elapsed += sim.last_converged_timestep_seconds()
+                    after_shut = elapsed > shut_seconds + 1.0
+                    topology = sim.get_live_well_topology()
+                    rates = sim.get_live_well_rates()
+                    names = [str(name) for name in topology["well_names"]]
+                    perf_well = np.asarray(topology["perf_well_index"])
+                    surface = np.asarray(rates["perf_water_surface_rate"], dtype=float)
+                    reservoir = np.asarray(rates["perf_water_reservoir_rate"], dtype=float)
+                    is_open = np.asarray(rates["well_is_open"], dtype=bool)
+                    perfs = {{name: np.flatnonzero(perf_well == n)
+                             for n, name in enumerate(names)}}
+                    assert perfs["XFLOW"].size == 3 and perfs["STOPXF"].size == 2, perfs
+                    days = elapsed / 86400.0
+
+                    xflow = perfs["XFLOW"]
+                    if after_shut:
+                        steps_after += 1
+                        # Exactly zero in both bases from the first step after the shut on.
+                        assert not is_open[names.index("XFLOW")], days
+                        assert np.all(surface[xflow] == 0.0), (days, surface[xflow])
+                        assert np.all(reservoir[xflow] == 0.0), (days, reservoir[xflow])
+                    else:
+                        steps_before += 1
+                        assert is_open[names.index("XFLOW")], days
+                        assert np.all(np.abs(surface[xflow]) > rate_threshold), \\
+                            (days, surface[xflow])
+                        assert np.all(np.abs(reservoir[xflow]) > rate_threshold), \\
+                            (days, reservoir[xflow])
+
+                    # The other wells keep flowing at every step, the STOPped STOPXF only
+                    # between its completions (not open, but non-zero in both bases).
+                    for name in ("INJ", "PROD", "STOPXF"):
+                        p = perfs[name]
+                        assert np.all(np.abs(surface[p]) > rate_threshold), \\
+                            (name, days, surface[p])
+                        assert np.all(np.abs(reservoir[p]) > rate_threshold), \\
+                            (name, days, reservoir[p])
+                    assert not is_open[names.index("STOPXF")], days
+
+                assert steps_before == 3 and steps_after >= 3, (steps_before, steps_after)
+                print("steps before and after the shut", steps_before, steps_after)
+                sim.step_cleanup()
+            """)
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=data_dir,
+                env=os.environ.copy(),
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            # The child's assertion message (step and rates) is only in its stderr.
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertIn("steps before and after the shut", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
