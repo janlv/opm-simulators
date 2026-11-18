@@ -23,7 +23,6 @@
 
 #include <opm/input/eclipse/EclipseState/Aquifer/AquiferConfig.hpp>
 #include <opm/input/eclipse/EclipseState/Aquifer/NumericalAquifer/NumericalAquifers.hpp>
-#include <opm/input/eclipse/EclipseState/Grid/FaceDir.hpp>
 #include <opm/input/eclipse/EclipseState/Grid/NNC.hpp>
 #include <opm/input/eclipse/Schedule/Well/Well.hpp>
 #include <opm/input/eclipse/Units/UnitSystem.hpp>
@@ -303,6 +302,10 @@ struct PyLiveReservoirData
             != cache.active_to_global.size()) {
             throw std::runtime_error("Reconstructed active-cell map contains duplicate cells.");
         }
+        cache.cartesian_active.assign(input_grid.getCartesianSize(), 0);
+        for (const auto global_cell : cache.active_to_global) {
+            cache.cartesian_active[static_cast<std::size_t>(global_cell)] = 1;
+        }
         cache.active_to_global_valid = true;
         return cache.active_to_global;
     }
@@ -340,6 +343,30 @@ struct PyLiveReservoirData
         return cache;
     }
 
+    // Water rate of every connection of the grid, each in exactly one place: the I+, J+ or K+
+    // array of a cell, or the rate of an NNC pair.
+    //
+    // The split is the one OPM's writer makes for the transmissibilities
+    // (EclGenericWriter::computeTrans_() and exportNncStructure_() in
+    // opm/simulators/flow/EclGenericWriter_impl.hpp); keep the two in step:
+    //   - a pair on the output NNC list is reported as its NNC rate and in no face array,
+    //     whichever of its two cells is being visited;
+    //   - any other pair of direct neighbours -- Cartesian index difference 1 (I), nx (J) or
+    //     nx*ny (K), or the same column with only inactive cells between (the pinch-out
+    //     connections, directVerticalNeighbors) -- is reported in the I+, J+ or K+ array of
+    //     the cell with the smaller Cartesian index, where INIT has its TRANX, TRANY or TRANZ;
+    //   - a face that is neither has a transmissibility the writer treats as zero (that is
+    //     why it is not on the NNC list) and is in no array.
+    // The face's own direction id must not choose the array. A face across a fault has the id
+    // of the side of the cell it lies on, so by the id its rate lands in the I+/J+ slot that a
+    // reader takes for the flow to the Cartesian neighbour, next to the same rate as an NNC.
+    //
+    // FLRWATI+/J+ of the restart file are not a reference for these arrays at fault cells
+    // (FLRWATK+ and FLRWATN+ are). createFlows() in
+    // opm/models/discretization/common/tpfalinearizer.hh goes by the direction id unless the
+    // visited cell is cell1 of an NNC pair, so the cell2 end of a pair keeps the NNC rate in
+    // its I+/J+ slot, and it appends the cell's boundary faces with zero flow, which clears
+    // the slot of a cell whose + side is partly exposed at a fault.
     static const PyLiveReservoirDataCache& ensureWaterFluxCache(Base& self)
     {
         auto& cache = liveNncTopologyCache(self);
@@ -347,10 +374,6 @@ struct PyLiveReservoirData
         if (cache.water_flux_valid && cache.water_flux_step == current_step) {
             return cache;
         }
-
-        const int x_face_id = FaceDir::ToIntersectionIndex(FaceDir::DirEnum::XPlus);
-        const int y_face_id = FaceDir::ToIntersectionIndex(FaceDir::DirEnum::YPlus);
-        const int z_face_id = FaceDir::ToIntersectionIndex(FaceDir::DirEnum::ZPlus);
 
         using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
         const auto& simulator = *self.simulator_;
@@ -365,6 +388,10 @@ struct PyLiveReservoirData
         cache.nnc_water_surface_rate.assign(cache.nnc_pairs.size(), 0.0);
 
         const auto& active_to_global = activeToGlobalCellVector(self);
+        const auto& cartesian_active = cache.cartesian_active;
+        const auto& input_grid = simulator.vanguard().eclState().getInputGrid();
+        const std::size_t nx = input_grid.getNX();
+        const std::size_t ny = input_grid.getNY();
         ElementContext elem_ctx(simulator);
         constexpr auto time_idx = 0u;
 
@@ -377,8 +404,13 @@ struct PyLiveReservoirData
             for (unsigned scvf_idx = 0; scvf_idx < elem_ctx.numInteriorFaces(time_idx); ++scvf_idx) {
                 const auto& face = stencil.interiorFace(scvf_idx);
                 const auto interior_dof = elem_ctx.globalSpaceIndex(face.interiorIndex(), time_idx);
+                const auto exterior_dof = elem_ctx.globalSpaceIndex(face.exteriorIndex(), time_idx);
+                if (interior_dof >= active_to_global.size() || exterior_dof >= active_to_global.size()) {
+                    throw std::runtime_error("Live face references an out-of-range active cell.");
+                }
                 const auto& ext_quants = elem_ctx.extensiveQuantities(scvf_idx, time_idx);
                 const auto alpha = getValue(ext_quants.extrusionFactor()) * face.area();
+                // Positive out of the visited (interior) cell.
                 const auto face_rate = alpha * getValue(ext_quants.volumeFlux(FluidSystem::waterPhaseIdx));
                 const auto upstream_dof = ext_quants.upstreamIndex(FluidSystem::waterPhaseIdx);
                 const auto& upstream_quants = elem_ctx.intensiveQuantities(upstream_dof, time_idx);
@@ -388,45 +420,43 @@ struct PyLiveReservoirData
                 // conserved water component as reservoir flux multiplied by upstream 1/Bw.
                 const auto surface_face_rate = face_rate * inv_b;
 
-                const auto dir_id = face.dirId();
-                if (dir_id == x_face_id) {
-                    cache.water_face_i[interior_dof] = face_rate;
-                    cache.water_surface_face_i[interior_dof] = surface_face_rate;
-                }
-                else if (dir_id == y_face_id) {
-                    cache.water_face_j[interior_dof] = face_rate;
-                    cache.water_surface_face_j[interior_dof] = surface_face_rate;
-                }
-                else if (dir_id == z_face_id) {
-                    cache.water_face_k[interior_dof] = face_rate;
-                    cache.water_surface_face_k[interior_dof] = surface_face_rate;
-                }
-
-                if (cache.nnc_output_index.empty()) {
-                    continue;
-                }
-
-                const auto exterior_dof = elem_ctx.globalSpaceIndex(face.exteriorIndex(), time_idx);
-                if (interior_dof >= active_to_global.size() || exterior_dof >= active_to_global.size()) {
-                    throw std::runtime_error("Live NNC face references an out-of-range active cell.");
-                }
-
                 const auto interior_global = static_cast<std::size_t>(active_to_global[interior_dof]);
                 const auto exterior_global = static_cast<std::size_t>(active_to_global[exterior_dof]);
                 const auto lower_global = std::min(interior_global, exterior_global);
                 const auto upper_global = std::max(interior_global, exterior_global);
+
                 const auto entry = cache.nnc_output_index.find(
                     LiveReservoirCellPair{lower_global, upper_global});
-                if (entry == cache.nnc_output_index.end()) {
+                if (entry != cache.nnc_output_index.end()) {
+                    // NNC rates are positive from cell1 to cell2 of the pair, and the list
+                    // has the smaller Cartesian index as cell1.
+                    const auto signed_rate = (interior_global == lower_global) ? face_rate : -face_rate;
+                    const auto signed_surface_rate =
+                        (interior_global == lower_global) ? surface_face_rate : -surface_face_rate;
+                    for (const auto index : entry->second) {
+                        cache.nnc_water_reservoir_rate[index] = signed_rate;
+                        cache.nnc_water_surface_rate[index] = signed_surface_rate;
+                    }
                     continue;
                 }
 
-                const auto signed_rate = (interior_global == lower_global) ? face_rate : -face_rate;
-                const auto signed_surface_rate =
-                    (interior_global == lower_global) ? surface_face_rate : -surface_face_rate;
-                for (const auto index : entry->second) {
-                    cache.nnc_water_reservoir_rate[index] = signed_rate;
-                    cache.nnc_water_surface_rate[index] = signed_surface_rate;
+                if (interior_global != lower_global) {
+                    continue; // the other cell reports this face as its + face
+                }
+                const auto offset = upper_global - lower_global;
+                if (offset == 1 && nx > 1) {
+                    cache.water_face_i[interior_dof] = face_rate;
+                    cache.water_surface_face_i[interior_dof] = surface_face_rate;
+                }
+                else if (offset == nx && ny > 1) {
+                    cache.water_face_j[interior_dof] = face_rate;
+                    cache.water_surface_face_j[interior_dof] = surface_face_rate;
+                }
+                else if (offset == nx * ny ||
+                         LiveReservoirDataDetail::directVerticalNeighbors(
+                             nx, ny, cartesian_active, lower_global, upper_global)) {
+                    cache.water_face_k[interior_dof] = face_rate;
+                    cache.water_surface_face_k[interior_dof] = surface_face_rate;
                 }
             }
         }
@@ -574,10 +604,7 @@ struct PyLiveReservoirData
         // and NNC code above rely on the same identity); entries are Cartesian indices
         // i + nx*(j + ny*k), increasing with the dof index.
         const auto& active_to_global = activeToGlobalCellVector(self);
-        std::vector<char> cartesian_active(input_grid.getCartesianSize(), 0);
-        for (const auto global_cell : active_to_global) {
-            cartesian_active[static_cast<std::size_t>(global_cell)] = 1;
-        }
+        const auto& cartesian_active = self.live_reservoir_data_cache_.cartesian_active;
 
         // Sorted Cartesian ids of numerical aquifer cells (the writer's isNumAquCell_()).
         const auto num_aqu_cells = ecl_state.aquifer().hasNumericalAquifer()

@@ -50,6 +50,9 @@ struct PyLiveReservoirDataCache
 {
     bool active_to_global_valid{false};
     std::vector<int> active_to_global{};
+    // Indexed by Cartesian cell, nonzero for a cell of the simulator grid. Filled together
+    // with active_to_global and valid under the same flag.
+    std::vector<char> cartesian_active{};
 
     bool nnc_topology_valid{false};
     std::vector<LiveReservoirCellPair> nnc_pairs{};
@@ -72,6 +75,7 @@ struct PyLiveReservoirDataCache
     {
         active_to_global_valid = false;
         active_to_global.clear();
+        cartesian_active.clear();
 
         nnc_topology_valid = false;
         nnc_pairs.clear();
